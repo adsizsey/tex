@@ -1,0 +1,43 @@
+from pylatex import Document, Section, Subsection, Command
+from pylatex.utils import NoEscape
+
+# Function to create and compile a LaTeX document
+def generate_tex():
+    # Create a new LaTeX document
+    doc = Document()
+    
+    # Add a title and author
+    doc.preamble.append(Command('title', 'Generated LaTeX Document'))
+    doc.preamble.append(Command('author', 'Python API'))
+    doc.preamble.append(Command('date', NoEscape(r'\today')))
+    doc.append(NoEscape(r'\maketitle'))
+    
+    # Add a section
+    with doc.create(Section('Introduction')):
+        doc.append('This is an example of a LaTeX document generated using the pylatex library.')
+    
+    # Add a subsection
+    with doc.create(Subsection('Subsection Example')):
+        doc.append('This subsection demonstrates how to organize content using pylatex.')
+    
+    # Add an equation
+    with doc.create(Section('Mathematics')):
+        doc.append(NoEscape(r'The famous equation is $E = mc^2$ which shows the relationship between energy and mass.'))
+    
+    # Add a bullet list
+    with doc.create(Section('Bullet List Example')):
+        doc.append(NoEscape(r'''
+\begin{itemize}
+  \item Item 1
+  \item Item 2
+  \item Item 3
+\end{itemize}
+        '''))
+    
+    # Generate PDF
+    doc.generate_pdf('generated_document', clean_tex=True)
+    print("Document compiled and saved as 'generated_document.pdf'")
+
+# Run the function
+if __name__ == "__main__":
+    generate_tex()

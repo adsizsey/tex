@@ -1,0 +1,54 @@
+from datasets import load_from_disk
+from transformers import AutoTokenizer
+from collections import Counter, defaultdict
+import math
+from nltk.util import ngrams
+
+# === Load your dataset and tokenizer ===
+dataset = load_from_disk("path_to_your_dataset")  # adjust path
+tokenizer = AutoTokenizer.from_pretrained("path_to_your_tokenizer")
+
+# === Provide the label ID-to-name mapping ===
+id2label = trainer.id_to_label  # e.g., {0: 'O', 1: 'B_Ticker', ...}
+
+# === Flatten token and label sequences ===
+all_tokens = []
+all_labels = []
+token_label_map = defaultdict(Counter)
+
+for input_ids, labels in zip(dataset['input_ids'], dataset['labels']):
+    tokens = tokenizer.convert_ids_to_tokens(input_ids)
+    label_names = [id2label[lbl] for lbl in labels]
+
+    all_tokens.extend(tokens)
+    all_labels.extend(label_names)
+
+    for tok, lbl in zip(tokens, label_names):
+        token_label_map[tok][lbl] += 1
+
+# === Token entropy ===
+token_counts = Counter(all_tokens)
+total = sum(token_counts.values())
+entropy = -sum((c / total) * math.log2(c / total) for c in token_counts.values())
+print(f"\n🔹 Token Entropy: {entropy:.2f}")
+
+print(f"\n🔹 Top 10 Most Common Tokens:")
+for tok, count in token_counts.most_common(10):
+    print(f"  {tok:15s} — {count}")
+
+# === Token-to-label mapping consistency ===
+always_same_label = [tok for tok, cnt in token_label_map.items() if len(cnt) == 1]
+print(f"\n🔹 Tokens that always map to the same label: {len(always_same_label)} / {len(token_label_map)}")
+
+# === Label sequence uniqueness ratio ===
+label_seqs = [tuple(id2label[lbl] for lbl in row) for row in dataset['labels']]
+unique_label_seqs = set(label_seqs)
+seq_ratio = len(unique_label_seqs) / len(label_seqs)
+print(f"\n🔹 Unique Label Sequence Ratio: {seq_ratio:.4f}")
+
+# === Top label trigrams ===
+label_trigrams = [ng for row in label_seqs for ng in ngrams(row, 3)]
+label_ngram_counts = Counter(label_trigrams).most_common(10)
+print("\n🔹 Top 10 Label Trigrams:")
+for ng, count in label_ngram_counts:
+    print(f"  {ng} — {count}")

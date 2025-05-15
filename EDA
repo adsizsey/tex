@@ -4,27 +4,24 @@ from collections import Counter, defaultdict
 import math
 from nltk.util import ngrams
 
-# === Load your dataset and tokenizer ===
+# === Load dataset and tokenizer ===
 dataset = load_from_disk("path_to_your_dataset")  # adjust path
 tokenizer = AutoTokenizer.from_pretrained("path_to_your_tokenizer")
+id2label = trainer.id_to_label  # e.g., {0: "O", 1: "B_Ticker", ...}
 
-# === Provide the label ID-to-name mapping ===
-id2label = trainer.id_to_label  # e.g., {0: 'O', 1: 'B_Ticker', ...}
-
-# === Flatten token and label sequences ===
+# === Flatten tokens and labels (filtering out -100s) ===
 all_tokens = []
 all_labels = []
 token_label_map = defaultdict(Counter)
 
 for input_ids, labels in zip(dataset['input_ids'], dataset['labels']):
     tokens = tokenizer.convert_ids_to_tokens(input_ids)
-    label_names = [id2label[lbl] for lbl in labels]
-
-    all_tokens.extend(tokens)
-    all_labels.extend(label_names)
-
-    for tok, lbl in zip(tokens, label_names):
-        token_label_map[tok][lbl] += 1
+    for tok, lbl in zip(tokens, labels):
+        if lbl != -100:
+            label_str = id2label[lbl]
+            all_tokens.append(tok)
+            all_labels.append(label_str)
+            token_label_map[tok][label_str] += 1
 
 # === Token entropy ===
 token_counts = Counter(all_tokens)
@@ -41,7 +38,11 @@ always_same_label = [tok for tok, cnt in token_label_map.items() if len(cnt) == 
 print(f"\n🔹 Tokens that always map to the same label: {len(always_same_label)} / {len(token_label_map)}")
 
 # === Label sequence uniqueness ratio ===
-label_seqs = [tuple(id2label[lbl] for lbl in row) for row in dataset['labels']]
+label_seqs = []
+for labels in dataset['labels']:
+    filtered_seq = [id2label[lbl] for lbl in labels if lbl != -100]
+    label_seqs.append(tuple(filtered_seq))
+
 unique_label_seqs = set(label_seqs)
 seq_ratio = len(unique_label_seqs) / len(label_seqs)
 print(f"\n🔹 Unique Label Sequence Ratio: {seq_ratio:.4f}")

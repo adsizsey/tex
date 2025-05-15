@@ -1,0 +1,89 @@
+from datasets import load_from_disk
+from transformers import AutoTokenizer
+from collections import defaultdict, Counter
+from tqdm import tqdm
+import torch
+import random
+from seqeval.metrics import classification_report, f1_score
+
+# === Load components ===
+dataset = load_from_disk("path_to_your_dataset")  # 🔁 adjust this
+tokenizer = AutoTokenizer.from_pretrained("path_to_your_tokenizer")
+model = trainer.model
+id2label = trainer.id_to_label
+label2id = {v: k for k, v in id2label.items()}
+model.eval()
+model.to("cuda" if torch.cuda.is_available() else "cpu")
+
+# === Perturbation logic ===
+def misspell_token(token):
+    if len(token) > 3:
+        i = random.randint(1, len(token) - 2)
+        return token[:i] + token[i+1] + token[i] + token[i+2:]
+    return token
+
+def inject_noise(tokens, insert_token="[NOISE]"):
+    idx = random.randint(0, len(tokens))
+    return tokens[:idx] + [insert_token] + tokens[idx:]
+
+def perturb_tokens(tokens, level='moderate'):
+    tokens = tokens.copy()
+    if level == 'mild':
+        return [misspell_token(tok) if random.random() < 0.1 else tok for tok in tokens]
+    elif level == 'moderate':
+        tokens = [misspell_token(tok) if random.random() < 0.2 else tok for tok in tokens]
+        return inject_noise(tokens)
+    elif level == 'aggressive':
+        tokens = [misspell_token(tok) for tok in tokens]
+        return inject_noise(tokens)
+    return tokens
+
+# === Prediction logic ===
+def predict_labels(encoded_input):
+    encoded_input = {k: v.to(model.device) for k, v in encoded_input.items()}
+    with torch.no_grad():
+        outputs = model(**encoded_input)
+        logits = outputs.logits
+        preds = torch.argmax(logits, dim=-1)
+    return preds.squeeze().tolist()
+
+def decode_labels(label_ids_batch):
+    return [[id2label[label_id] for label_id in seq if label_id != -100] for seq in label_ids_batch]
+
+# === Evaluation function ===
+def evaluate(dataset, perturb=False, level='moderate', sample_size=200):
+    all_preds, all_true = [], []
+    sample_data = dataset.select(range(min(len(dataset), sample_size)))  # Optional subsample
+    for input_ids, labels in tqdm(zip(sample_data['input_ids'], sample_data['labels']), total=len(sample_data)):
+        tokens = tokenizer.convert_ids_to_tokens(input_ids)
+        true_seq = [id2label[lbl] for lbl in labels if lbl != -100]
+        if perturb:
+            tokens = perturb_tokens(tokens, level=level)
+
+        encoded = tokenizer(tokens, is_split_into_words=True, return_tensors="pt", truncation=True, padding='max_length')
+        pred_seq = predict_labels(encoded)
+
+        # Filter preds where ground truth != -100
+        pred_filtered = [id2label[lbl] for i, lbl in enumerate(pred_seq) if labels[i] != -100]
+        all_preds.append(pred_filtered)
+        all_true.append(true_seq)
+    return all_true, all_preds
+
+# === Run both evaluations ===
+print("🔍 Evaluating on original data...")
+true_orig, pred_orig = evaluate(dataset, perturb=False)
+
+print("\n💥 Evaluating on perturbed data...")
+true_pert, pred_pert = evaluate(dataset, perturb=True, level='moderate')
+
+# === Print reports ===
+print("\n📊 Original Data Classification Report:")
+print(classification_report(true_orig, pred_orig))
+print(f"F1 Score (original): {f1_score(true_orig, pred_orig):.4f}")
+
+print("\n⚠️ Perturbed Data Classification Report:")
+print(classification_report(true_pert, pred_pert))
+print(f"F1 Score (perturbed): {f1_score(true_pert, pred_pert):.4f}")
+
+delta = f1_score(true_orig, pred_orig) - f1_score(true_pert, pred_pert)
+print(f"\n🔻 F1 Score Drop due to Perturbation: {delta:.4f}")

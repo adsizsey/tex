@@ -1,13 +1,12 @@
 from datasets import load_from_disk
 from transformers import AutoTokenizer
-from collections import defaultdict, Counter
 from tqdm import tqdm
 import torch
 import random
 from seqeval.metrics import classification_report, f1_score
 
 # === Load components ===
-dataset = load_from_disk("path_to_your_dataset")  # 🔁 adjust this
+dataset = load_from_disk("path_to_your_dataset")  # 🔁 Adjust this
 tokenizer = AutoTokenizer.from_pretrained("path_to_your_tokenizer")
 model = trainer.model
 id2label = trainer.id_to_label
@@ -47,36 +46,49 @@ def predict_labels(encoded_input):
         preds = torch.argmax(logits, dim=-1)
     return preds.squeeze().tolist()
 
-def decode_labels(label_ids_batch):
-    return [[id2label[label_id] for label_id in seq if label_id != -100] for seq in label_ids_batch]
-
-# === Evaluation function ===
+# === Evaluation function with safe alignment ===
 def evaluate(dataset, perturb=False, level='moderate', sample_size=200):
     all_preds, all_true = [], []
-    sample_data = dataset.select(range(min(len(dataset), sample_size)))  # Optional subsample
+    sample_data = dataset.select(range(min(len(dataset), sample_size)))
     for input_ids, labels in tqdm(zip(sample_data['input_ids'], sample_data['labels']), total=len(sample_data)):
+        # Step 1: Decode tokens from input_ids
         tokens = tokenizer.convert_ids_to_tokens(input_ids)
-        true_seq = [id2label[lbl] for lbl in labels if lbl != -100]
         if perturb:
             tokens = perturb_tokens(tokens, level=level)
 
+        # Step 2: Re-encode perturbed tokens
         encoded = tokenizer(tokens, is_split_into_words=True, return_tensors="pt", truncation=True, padding='max_length')
+        word_ids = encoded.word_ids(batch_index=0)
         pred_seq = predict_labels(encoded)
 
-        # Filter preds where ground truth != -100
-        pred_filtered = [id2label[lbl] for i, lbl in enumerate(pred_seq) if labels[i] != -100]
-        all_preds.append(pred_filtered)
-        all_true.append(true_seq)
+        # Step 3: Align predictions and true labels
+        aligned_preds = []
+        aligned_labels = []
+        previous_word_idx = None
+
+        for i, word_idx in enumerate(word_ids):
+            if word_idx is None:
+                continue  # Skip special tokens
+            if word_idx != previous_word_idx:  # Only use first sub-token
+                if word_idx < len(labels) and labels[word_idx] != -100:
+                    aligned_preds.append(id2label[pred_seq[i]])
+                    aligned_labels.append(id2label[labels[word_idx]])
+                previous_word_idx = word_idx
+
+        if aligned_preds and aligned_labels:
+            all_preds.append(aligned_preds)
+            all_true.append(aligned_labels)
+
     return all_true, all_preds
 
-# === Run both evaluations ===
+# === Run evaluations ===
 print("🔍 Evaluating on original data...")
 true_orig, pred_orig = evaluate(dataset, perturb=False)
 
 print("\n💥 Evaluating on perturbed data...")
 true_pert, pred_pert = evaluate(dataset, perturb=True, level='moderate')
 
-# === Print reports ===
+# === Report metrics ===
 print("\n📊 Original Data Classification Report:")
 print(classification_report(true_orig, pred_orig))
 print(f"F1 Score (original): {f1_score(true_orig, pred_orig):.4f}")

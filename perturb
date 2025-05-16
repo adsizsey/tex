@@ -17,19 +17,13 @@ def is_date(token):
 def realistic_misspell(token):
     if token in ['[PAD]', '[CLS]', '[SEP]']:
         return token
-
     if is_number(token):
         return token[::-1] if random.random() < 0.05 else token
-
     if is_date(token):
-        if random.random() < 0.05:
-            return token.replace("/", "-") if "/" in token else token.replace("-", "/")
-        return token
-
+        return token.replace("/", "-") if "/" in token and random.random() < 0.05 else token
     if len(token) > 3:
         i = random.randint(1, len(token) - 2)
         return token[:i] + token[i+1] + token[i] + token[i+2:]
-    
     return token
 
 # === Realistic noise injection ===
@@ -43,14 +37,11 @@ def realistic_inject_noise(tokens, level="moderate"):
 # === Perturbation driver ===
 def smart_perturb_input_ids(original_input_ids, tokenizer, model, level="moderate", type="Combined"):
     tokens = tokenizer.convert_ids_to_tokens(original_input_ids)
-
     if type in ["Misspelling", "Combined"]:
         rate = {"mild": 0.1, "moderate": 0.2, "aggressive": 0.3}[level]
         tokens = [realistic_misspell(tok) if random.random() < rate else tok for tok in tokens]
-
     if type in ["Noise Injection", "Combined"]:
         tokens = realistic_inject_noise(tokens, level=level)
-
     encoded = tokenizer(
         tokens,
         is_split_into_words=True,
@@ -61,41 +52,54 @@ def smart_perturb_input_ids(original_input_ids, tokenizer, model, level="moderat
     )
     return encoded["input_ids"].squeeze().tolist()
 
-# === Evaluation function ===
+# === Robust evaluation function ===
 def evaluate(dataset, model, tokenizer, perturb=False, perturb_level="moderate", sample_size=200, perturb_type="Combined"):
     model.eval()
     device = model.device
-
     all_preds, all_labels = []
-    subset = dataset.select(range(min(sample_size, len(dataset)))) if sample_size else dataset
+
+    if "input_ids" not in dataset.features or "labels" not in dataset.features:
+        print("❌ Dataset missing required columns. Skipping.")
+        return {"accuracy": 0.0, "precision": 0.0, "recall": 0.0, "f1": 0.0}
+
+    try:
+        subset = dataset.select(range(min(sample_size, len(dataset))))
+    except Exception:
+        print("⚠️ Could not subset. Falling back to full dataset.")
+        subset = dataset
 
     for input_ids, labels in tqdm(zip(subset["input_ids"], subset["labels"]), total=len(subset)):
-        original_labels = labels
+        try:
+            original_labels = labels
 
-        if perturb:
-            try:
+            if perturb:
                 input_ids = smart_perturb_input_ids(input_ids, tokenizer, model, level=perturb_level, type=perturb_type)
-            except Exception:
-                continue
 
-        attention_mask = [1 if tok != tokenizer.pad_token_id else 0 for tok in input_ids]
-        encoded = {
-            "input_ids": torch.tensor([input_ids]).to(device),
-            "attention_mask": torch.tensor([attention_mask]).to(device)
-        }
+            attention_mask = [1 if tok != tokenizer.pad_token_id else 0 for tok in input_ids]
+            encoded = {
+                "input_ids": torch.tensor([input_ids]).to(device),
+                "attention_mask": torch.tensor([attention_mask]).to(device)
+            }
 
-        with torch.no_grad():
-            logits = model(**encoded).logits
+            with torch.no_grad():
+                logits = model(**encoded).logits
 
-        preds = torch.argmax(logits, dim=-1).squeeze().tolist()
-        preds = preds[:len(original_labels)]
+            preds = torch.argmax(logits, dim=-1).squeeze().tolist()
+            preds = preds[:len(original_labels)]
 
-        filtered_preds = [p for p, l in zip(preds, original_labels) if l != -100]
-        filtered_labels = [l for l in original_labels if l != -100]
+            filtered_preds = [p for p, l in zip(preds, original_labels) if l != -100]
+            filtered_labels = [l for l in original_labels if l != -100]
 
-        if filtered_preds and filtered_labels:
-            all_preds.extend(filtered_preds)
-            all_labels.extend(filtered_labels)
+            if filtered_preds and filtered_labels:
+                all_preds.extend(filtered_preds)
+                all_labels.extend(filtered_labels)
+
+        except Exception as e:
+            print(f"⚠️ Skipping sample due to error: {e}")
+            continue
+
+    if not all_labels:
+        return {"accuracy": 0.0, "precision": 0.0, "recall": 0.0, "f1": 0.0}
 
     precision, recall, f1, _ = precision_recall_fscore_support(all_labels, all_preds, average="weighted", zero_division=0)
     acc = accuracy_score(all_labels, all_preds)
@@ -107,10 +111,9 @@ def evaluate(dataset, model, tokenizer, perturb=False, perturb_level="moderate",
         "f1": round(f1, 4)
     }
 
-# === Experiment runner ===
+# === Run full perturbation experiment ===
 def run_perturbation_experiments(dataset, model, tokenizer, sample_size=200):
     results = []
-
     scenarios = [
         {"perturb": False, "label": "None", "level": "–"},
         {"perturb": True, "label": "Misspelling", "level": "mild"},
@@ -121,11 +124,10 @@ def run_perturbation_experiments(dataset, model, tokenizer, sample_size=200):
         {"perturb": True, "label": "Combined", "level": "moderate"},
         {"perturb": True, "label": "Combined", "level": "aggressive"},
     ]
-
     baseline_f1 = None
 
     for s in scenarios:
-        print(f"Evaluating: {s['label']} | Level: {s['level']}")
+        print(f"\n🔍 Evaluating: {s['label']} | Level: {s['level']}")
         metrics = evaluate(
             dataset=dataset,
             model=model,
@@ -148,7 +150,6 @@ def run_perturbation_experiments(dataset, model, tokenizer, sample_size=200):
 
     return pd.DataFrame(results)
 
-# === Final usage ===
-# Run this after defining the above
+# === To run ===
 # df_results = run_perturbation_experiments(dataset, model, tokenizer, sample_size=200)
 # display(df_results)

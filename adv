@@ -1,93 +1,64 @@
-import torch
+from collections import defaultdict, Counter
 import numpy as np
-from sklearn.metrics import precision_recall_fscore_support, accuracy_score
-from tqdm import tqdm
-import random
+import math
+import pandas as pd
 
-# === Perturbation logic ===
-def misspell_token(token):
-    if len(token) > 3:
-        i = random.randint(1, len(token) - 2)
-        return token[:i] + token[i+1] + token[i] + token[i+2:]
-    return token
+# Use already-loaded variables:
+# tokenizer, dataset, id_to_label
 
-def inject_noise(tokens):
-    return tokens[:random.randint(0, len(tokens))] + ["[NOISE]"] + tokens[random.randint(0, len(tokens)):]
+token_freq = Counter()
+token_label_map = defaultdict(Counter)
+label_sequences = set()
+label_ngrams = Counter()
+sequence_lengths = []
 
-def perturb_input_ids(original_input_ids, tokenizer, model, level="moderate"):
-    tokens = tokenizer.convert_ids_to_tokens(original_input_ids)
+for input_ids, labels in zip(dataset["input_ids"], dataset["labels"]):
+    tokens = tokenizer.convert_ids_to_tokens(input_ids)
 
-    if level == "mild":
-        tokens = [misspell_token(tok) if random.random() < 0.1 else tok for tok in tokens]
-    elif level == "moderate":
-        tokens = [misspell_token(tok) if random.random() < 0.2 else tok for tok in tokens]
-        tokens = inject_noise(tokens)
+    # Filter out special tokens and labels with -100
+    clean = [(tok, lbl) for tok, lbl in zip(tokens, labels) if lbl != -100]
+    if not clean:
+        continue
 
-    encoded = tokenizer(
-        tokens,
-        is_split_into_words=True,
-        return_tensors="pt",
-        truncation=True,
-        padding="max_length",
-        max_length=model.config.max_position_embeddings
-    )
-    return encoded["input_ids"].squeeze().tolist()
+    tokens_filtered, labels_filtered = zip(*clean)
+    label_names = [id_to_label[lbl] for lbl in labels_filtered]
 
-# === Evaluation function ===
-def evaluate(dataset, model, tokenizer, perturb=False, perturb_level="moderate", sample_size=200):
-    model.eval()
-    device = model.device
+    for tok, lbl in zip(tokens_filtered, labels_filtered):
+        token_freq[tok] += 1
+        token_label_map[tok][lbl] += 1
 
-    all_preds, all_labels = [], []
-    subset = dataset.select(range(min(sample_size, len(dataset)))) if sample_size else dataset
+    label_sequences.add(tuple(label_names))
+    for i in range(len(label_names) - 1):
+        label_ngrams[(label_names[i], label_names[i + 1])] += 1
 
-    for input_ids, labels in tqdm(zip(subset["input_ids"], subset["labels"]), total=len(subset)):
-        original_labels = labels
+    sequence_lengths.append(len(label_names))
 
-        if perturb:
-            try:
-                input_ids = perturb_input_ids(input_ids, tokenizer, model, level=perturb_level)
-            except Exception:
-                continue
+# Compute stats
+total_tokens = sum(token_freq.values())
+token_entropy = -sum((freq / total_tokens) * math.log2(freq / total_tokens) for freq in token_freq.values())
 
-        attention_mask = [1 if tok != tokenizer.pad_token_id else 0 for tok in input_ids]
-        encoded = {
-            "input_ids": torch.tensor([input_ids]).to(device),
-            "attention_mask": torch.tensor([attention_mask]).to(device)
-        }
+total_unique_tokens = len(token_label_map)
+rigid_tokens = sum(1 for labels in token_label_map.values() if len(labels) == 1)
+rigid_ratio = rigid_tokens / total_unique_tokens if total_unique_tokens else 0
 
-        with torch.no_grad():
-            logits = model(**encoded).logits
+unique_seq_ratio = len(label_sequences) / len(dataset)
+avg_seq_len = np.mean(sequence_lengths)
 
-        preds = torch.argmax(logits, dim=-1).squeeze().tolist()
-        preds = preds[:len(original_labels)]
+# Summary
+summary = pd.DataFrame([{
+    "Token Entropy": round(token_entropy, 4),
+    "Total Unique Tokens": total_unique_tokens,
+    "Tokens with One Label Only": rigid_tokens,
+    "Token-Label Rigidity Ratio": round(rigid_ratio, 4),
+    "Unique Label Sequence Ratio": round(unique_seq_ratio, 4),
+    "Average Sequence Length": round(avg_seq_len, 2)
+}])
 
-        filtered_preds = [p for p, l in zip(preds, original_labels) if l != -100]
-        filtered_labels = [l for l in original_labels if l != -100]
+# Show summary
+from IPython.display import display
+display(summary)
 
-        if filtered_preds and filtered_labels:
-            all_preds.extend(filtered_preds)
-            all_labels.extend(filtered_labels)
-
-    precision, recall, f1, _ = precision_recall_fscore_support(all_labels, all_preds, average="weighted", zero_division=0)
-    acc = accuracy_score(all_labels, all_preds)
-
-    return {
-        "accuracy": round(acc, 4),
-        "precision": round(precision, 4),
-        "recall": round(recall, 4),
-        "f1": round(f1, 4)
-    }
-
-# === Run both evaluations ===
-print("🔍 Evaluating on original dataset...")
-metrics_orig = evaluate(dataset, model, tokenizer, perturb=False, sample_size=200)
-
-print("\n💥 Evaluating on perturbed dataset...")
-metrics_pert = evaluate(dataset, model, tokenizer, perturb=True, perturb_level="moderate", sample_size=200)
-
-# === Print results ===
-print("\n📊 Evaluation Results:")
-print(f"Original:  {metrics_orig}")
-print(f"Perturbed: {metrics_pert}")
-print(f"🔻 F1 Drop: {metrics_orig['f1'] - metrics_pert['f1']:.4f}")
+# Optional: top label bigrams
+print("\nTop 10 frequent label bigrams:")
+for bigram, count in label_ngrams.most_common(10):
+    print(f"{bigram}: {count}")

@@ -1,0 +1,113 @@
+import re
+import random
+import pandas as pd
+from tqdm import tqdm
+
+# === Helper: Token classification ===
+def is_number(token):
+    return re.fullmatch(r"\d+(\.\d+)?", token) is not None
+
+def is_date(token):
+    return re.fullmatch(r"\d{1,2}[/\-]\d{1,2}", token) is not None
+
+# === Realistic misspelling ===
+def realistic_misspell(token):
+    if token in ['[PAD]', '[CLS]', '[SEP]']:
+        return token
+
+    if is_number(token):
+        return token[::-1] if random.random() < 0.05 else token
+
+    if is_date(token):
+        if random.random() < 0.05:
+            return token.replace("/", "-") if "/" in token else token.replace("-", "/")
+        return token
+
+    if len(token) > 3:
+        i = random.randint(1, len(token) - 2)
+        return token[:i] + token[i+1] + token[i] + token[i+2:]
+    
+    return token
+
+# === Realistic noise injection ===
+def realistic_inject_noise(tokens, level="moderate"):
+    count = {"mild": 0, "moderate": 1, "aggressive": 2}[level]
+    for _ in range(count):
+        idx = random.randint(0, len(tokens))
+        tokens = tokens[:idx] + ["[NOISE]"] + tokens[idx:]
+    return tokens
+
+# === Smarter perturbation driver ===
+def smart_perturb_input_ids(original_input_ids, tokenizer, model, level="moderate", type="Combined"):
+    tokens = tokenizer.convert_ids_to_tokens(original_input_ids)
+
+    # Apply misspelling
+    if type in ["Misspelling", "Combined"]:
+        rate = {"mild": 0.1, "moderate": 0.2, "aggressive": 0.3}[level]
+        tokens = [realistic_misspell(tok) if random.random() < rate else tok for tok in tokens]
+
+    # Apply noise injection
+    if type in ["Noise Injection", "Combined"]:
+        tokens = realistic_inject_noise(tokens, level=level)
+
+    encoded = tokenizer(
+        tokens,
+        is_split_into_words=True,
+        return_tensors="pt",
+        padding="max_length",
+        truncation=True,
+        max_length=model.config.max_position_embeddings
+    )
+    return encoded["input_ids"].squeeze().tolist()
+
+# === Evaluation with scenario patching ===
+def run_perturbation_experiments(dataset, model, tokenizer, evaluate_fn, sample_size=200):
+    results = []
+
+    scenarios = [
+        {"perturb": False, "label": "None", "level": "–"},
+        {"perturb": True, "label": "Misspelling", "level": "mild"},
+        {"perturb": True, "label": "Misspelling", "level": "moderate"},
+        {"perturb": True, "label": "Misspelling", "level": "aggressive"},
+        {"perturb": True, "label": "Noise Injection", "level": "mild"},
+        {"perturb": True, "label": "Noise Injection", "level": "moderate"},
+        {"perturb": True, "label": "Combined", "level": "moderate"},
+        {"perturb": True, "label": "Combined", "level": "aggressive"},
+    ]
+
+    baseline_f1 = None
+
+    for scenario in scenarios:
+        print(f"Evaluating: {scenario['label']} | Level: {scenario['level']}")
+
+        if scenario["label"] == "None":
+            metrics = evaluate_fn(dataset, model, tokenizer, perturb=False, sample_size=sample_size)
+        else:
+            def patched_perturb_fn(original_input_ids):
+                return smart_perturb_input_ids(
+                    original_input_ids,
+                    tokenizer=tokenizer,
+                    model=model,
+                    level=scenario["level"],
+                    type=scenario["label"]
+                )
+
+            # Monkey-patch your evaluation to use the new perturb function
+            metrics = evaluate_fn(dataset, model, tokenizer, perturb=True, sample_size=sample_size, custom_perturb=patched_perturb_fn)
+
+        if baseline_f1 is None:
+            baseline_f1 = metrics["f1"]
+
+        results.append({
+            "Perturbation": scenario["label"],
+            "Level": scenario["level"],
+            "F1 Score": metrics["f1"],
+            "F1 vs Clean": round(metrics["f1"] - baseline_f1, 4)
+        })
+
+    return pd.DataFrame(results)
+
+# === Usage Example ===
+# Run this line in your notebook after defining everything above
+# df_results = run_perturbation_experiments(dataset, model, tokenizer, evaluate)
+# display(df_results)

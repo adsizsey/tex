@@ -1,0 +1,84 @@
+import torch
+import random
+import re
+
+# === Perturbation function (string level) ===
+def apply_realistic_perturbation_to_string(text, level="moderate", type="Misspelling"):
+    tokens = text.split()
+
+    def realistic_misspell(token):
+        if re.fullmatch(r"\d+(\.\d+)?", token):
+            return token[::-1] if random.random() < 0.2 else token
+        if re.fullmatch(r"\d{1,2}[/\-]\d{1,2}", token):
+            return token.replace("/", "-") if "/" in token and random.random() < 0.3 else token
+        if len(token) > 3 and random.random() < 0.4:
+            i = random.randint(1, len(token) - 2)
+            return token[:i] + token[i+1] + token[i] + token[i+2:]
+        return token
+
+    def inject_noise(tokens, level):
+        count = {"mild": 0, "moderate": 1, "aggressive": 2}[level]
+        for _ in range(count):
+            idx = random.randint(0, len(tokens))
+            tokens = tokens[:idx] + ["[NOISE]"] + tokens[idx:]
+        return tokens
+
+    # Apply perturbation
+    if type in ["Misspelling", "Combined"]:
+        tokens = [realistic_misspell(tok) for tok in tokens]
+    if type in ["Noise Injection", "Combined"]:
+        tokens = inject_noise(tokens, level)
+
+    return " ".join(tokens)
+
+# === Compare predictions on original vs perturbed ===
+def compare_predictions_on_text_sample(dataset, model, tokenizer, id_to_label, sample_index=0, perturb_level="moderate", perturb_type="Misspelling"):
+    sample = dataset[sample_index]
+    original_text = sample["text"]
+
+    # Create perturbed version
+    perturbed_text = apply_realistic_perturbation_to_string(original_text, level=perturb_level, type=perturb_type)
+
+    # Tokenize both
+    encoded_orig = tokenizer(
+        original_text,
+        return_tensors="pt",
+        padding="max_length",
+        truncation=True,
+        max_length=model.config.max_position_embeddings,
+        return_offsets_mapping=True
+    ).to(model.device)
+
+    encoded_pert = tokenizer(
+        perturbed_text,
+        return_tensors="pt",
+        padding="max_length",
+        truncation=True,
+        max_length=model.config.max_position_embeddings,
+        return_offsets_mapping=True
+    ).to(model.device)
+
+    with torch.no_grad():
+        logits_orig = model(**encoded_orig).logits
+        logits_pert = model(**encoded_pert).logits
+
+    pred_orig = torch.argmax(logits_orig, dim=-1).squeeze().tolist()
+    pred_pert = torch.argmax(logits_pert, dim=-1).squeeze().tolist()
+
+    # Decode tokens (excluding special tokens)
+    tokens_orig = tokenizer.convert_ids_to_tokens(encoded_orig["input_ids"].squeeze().tolist())
+    tokens_pert = tokenizer.convert_ids_to_tokens(encoded_pert["input_ids"].squeeze().tolist())
+
+    results = []
+    for tok_o, tok_p, lab_o, lab_p in zip(tokens_orig, tokens_pert, pred_orig, pred_pert):
+        if tok_o in ['[CLS]', '[SEP]', '[PAD]']:
+            continue
+        results.append((tok_o, id_to_label.get(lab_o, "UNK"), tok_p, id_to_label.get(lab_p, "UNK")))
+
+    # Print
+    print(f"\nOriginal Text:   {original_text}")
+    print(f"Perturbed Text:  {perturbed_text}\n")
+    print(f"{'Original Token':20} {'Pred Label':15} || {'Perturbed Token':20} {'Pred Label':15}")
+    print("-" * 80)
+    for tok_o, lab_o, tok_p, lab_p in results:
+        print(f"{tok_o:20} {lab_o:15} || {tok_p:20} {lab_p:15}")

@@ -1,18 +1,8 @@
-from datasets import load_from_disk
-from transformers import AutoTokenizer
-from tqdm import tqdm
 import torch
+import numpy as np
+from sklearn.metrics import precision_recall_fscore_support, accuracy_score
+from tqdm import tqdm
 import random
-from seqeval.metrics import classification_report, f1_score
-
-# === Load components ===
-dataset = load_from_disk("path_to_your_dataset")  # 🔁 Adjust this
-tokenizer = AutoTokenizer.from_pretrained("path_to_your_tokenizer")
-model = trainer.model
-id2label = trainer.id_to_label
-label2id = {v: k for k, v in id2label.items()}
-model.eval()
-model.to("cuda" if torch.cuda.is_available() else "cpu")
 
 # === Perturbation logic ===
 def misspell_token(token):
@@ -21,81 +11,83 @@ def misspell_token(token):
         return token[:i] + token[i+1] + token[i] + token[i+2:]
     return token
 
-def inject_noise(tokens, insert_token="[NOISE]"):
-    idx = random.randint(0, len(tokens))
-    return tokens[:idx] + [insert_token] + tokens[idx:]
+def inject_noise(tokens):
+    return tokens[:random.randint(0, len(tokens))] + ["[NOISE]"] + tokens[random.randint(0, len(tokens)):]
 
-def perturb_tokens(tokens, level='moderate'):
-    tokens = tokens.copy()
-    if level == 'mild':
-        return [misspell_token(tok) if random.random() < 0.1 else tok for tok in tokens]
-    elif level == 'moderate':
+def perturb_input_ids(original_input_ids, tokenizer, model, level="moderate"):
+    tokens = tokenizer.convert_ids_to_tokens(original_input_ids)
+
+    if level == "mild":
+        tokens = [misspell_token(tok) if random.random() < 0.1 else tok for tok in tokens]
+    elif level == "moderate":
         tokens = [misspell_token(tok) if random.random() < 0.2 else tok for tok in tokens]
-        return inject_noise(tokens)
-    elif level == 'aggressive':
-        tokens = [misspell_token(tok) for tok in tokens]
-        return inject_noise(tokens)
-    return tokens
+        tokens = inject_noise(tokens)
 
-# === Prediction logic ===
-def predict_labels(encoded_input):
-    encoded_input = {k: v.to(model.device) for k, v in encoded_input.items()}
-    with torch.no_grad():
-        outputs = model(**encoded_input)
-        logits = outputs.logits
-        preds = torch.argmax(logits, dim=-1)
-    return preds.squeeze().tolist()
+    encoded = tokenizer(
+        tokens,
+        is_split_into_words=True,
+        return_tensors="pt",
+        truncation=True,
+        padding="max_length",
+        max_length=model.config.max_position_embeddings
+    )
+    return encoded["input_ids"].squeeze().tolist()
 
-# === Evaluation function with safe alignment ===
-def evaluate(dataset, perturb=False, level='moderate', sample_size=200):
-    all_preds, all_true = [], []
-    sample_data = dataset.select(range(min(len(dataset), sample_size)))
-    for input_ids, labels in tqdm(zip(sample_data['input_ids'], sample_data['labels']), total=len(sample_data)):
-        # Step 1: Decode tokens from input_ids
-        tokens = tokenizer.convert_ids_to_tokens(input_ids)
+# === Evaluation function ===
+def evaluate(dataset, model, tokenizer, perturb=False, perturb_level="moderate", sample_size=200):
+    model.eval()
+    device = model.device
+
+    all_preds, all_labels = [], []
+    subset = dataset.select(range(min(sample_size, len(dataset)))) if sample_size else dataset
+
+    for input_ids, labels in tqdm(zip(subset["input_ids"], subset["labels"]), total=len(subset)):
+        original_labels = labels
+
         if perturb:
-            tokens = perturb_tokens(tokens, level=level)
+            try:
+                input_ids = perturb_input_ids(input_ids, tokenizer, model, level=perturb_level)
+            except Exception:
+                continue
 
-        # Step 2: Re-encode perturbed tokens
-        encoded = tokenizer(tokens, is_split_into_words=True, return_tensors="pt", truncation=True, padding='max_length')
-        word_ids = encoded.word_ids(batch_index=0)
-        pred_seq = predict_labels(encoded)
+        attention_mask = [1 if tok != tokenizer.pad_token_id else 0 for tok in input_ids]
+        encoded = {
+            "input_ids": torch.tensor([input_ids]).to(device),
+            "attention_mask": torch.tensor([attention_mask]).to(device)
+        }
 
-        # Step 3: Align predictions and true labels
-        aligned_preds = []
-        aligned_labels = []
-        previous_word_idx = None
+        with torch.no_grad():
+            logits = model(**encoded).logits
 
-        for i, word_idx in enumerate(word_ids):
-            if word_idx is None:
-                continue  # Skip special tokens
-            if word_idx != previous_word_idx:  # Only use first sub-token
-                if word_idx < len(labels) and labels[word_idx] != -100:
-                    aligned_preds.append(id2label[pred_seq[i]])
-                    aligned_labels.append(id2label[labels[word_idx]])
-                previous_word_idx = word_idx
+        preds = torch.argmax(logits, dim=-1).squeeze().tolist()
+        preds = preds[:len(original_labels)]
 
-        if aligned_preds and aligned_labels:
-            all_preds.append(aligned_preds)
-            all_true.append(aligned_labels)
+        filtered_preds = [p for p, l in zip(preds, original_labels) if l != -100]
+        filtered_labels = [l for l in original_labels if l != -100]
 
-    return all_true, all_preds
+        if filtered_preds and filtered_labels:
+            all_preds.extend(filtered_preds)
+            all_labels.extend(filtered_labels)
 
-# === Run evaluations ===
-print("🔍 Evaluating on original data...")
-true_orig, pred_orig = evaluate(dataset, perturb=False)
+    precision, recall, f1, _ = precision_recall_fscore_support(all_labels, all_preds, average="weighted", zero_division=0)
+    acc = accuracy_score(all_labels, all_preds)
 
-print("\n💥 Evaluating on perturbed data...")
-true_pert, pred_pert = evaluate(dataset, perturb=True, level='moderate')
+    return {
+        "accuracy": round(acc, 4),
+        "precision": round(precision, 4),
+        "recall": round(recall, 4),
+        "f1": round(f1, 4)
+    }
 
-# === Report metrics ===
-print("\n📊 Original Data Classification Report:")
-print(classification_report(true_orig, pred_orig))
-print(f"F1 Score (original): {f1_score(true_orig, pred_orig):.4f}")
+# === Run both evaluations ===
+print("🔍 Evaluating on original dataset...")
+metrics_orig = evaluate(dataset, model, tokenizer, perturb=False, sample_size=200)
 
-print("\n⚠️ Perturbed Data Classification Report:")
-print(classification_report(true_pert, pred_pert))
-print(f"F1 Score (perturbed): {f1_score(true_pert, pred_pert):.4f}")
+print("\n💥 Evaluating on perturbed dataset...")
+metrics_pert = evaluate(dataset, model, tokenizer, perturb=True, perturb_level="moderate", sample_size=200)
 
-delta = f1_score(true_orig, pred_orig) - f1_score(true_pert, pred_pert)
-print(f"\n🔻 F1 Score Drop due to Perturbation: {delta:.4f}")
+# === Print results ===
+print("\n📊 Evaluation Results:")
+print(f"Original:  {metrics_orig}")
+print(f"Perturbed: {metrics_pert}")
+print(f"🔻 F1 Drop: {metrics_orig['f1'] - metrics_pert['f1']:.4f}")

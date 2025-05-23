@@ -78,7 +78,7 @@ def trace_prediction_examples(dataset, model, tokenizer, id_to_label, label_to_i
         sample = dataset[i]
         words = sample["text"].split()
         label_ids = sample["labels"]
-        label_strs = [id_to_label.get(int(l), "O") if l != -100 else "O" for l in label_ids]
+        label_strs = [id_to_label.get(int(l), "O") if isinstance(l, int) and l != -100 else "O" for l in label_ids]
 
         encoding, aligned, tokens = perturb_and_tokenize(words, label_strs, tokenizer, label_to_id, strategy, target)
         input_tensor = {k: v.to(model.device) for k, v in encoding.items()}
@@ -93,8 +93,10 @@ def trace_prediction_examples(dataset, model, tokenizer, id_to_label, label_to_i
         for idx, (tok, true_id, pred_id) in enumerate(zip(decoded_tokens, aligned, predictions)):
             if tok in ["[CLS]", "[SEP]", "[PAD]"] or true_id == -100:
                 continue
-            true_label = id_to_label.get(true_id if isinstance(true_id, int) else int(true_id[0]), "?")
-            pred_label = id_to_label.get(pred_id if isinstance(pred_id, int) else int(pred_id[0]), "?")
+            if isinstance(true_id, list): true_id = true_id[0]
+            if isinstance(pred_id, list): pred_id = pred_id[0]
+            true_label = id_to_label.get(true_id, "?")
+            pred_label = id_to_label.get(pred_id, "?")
             result_rows.append({
                 "Idx": idx,
                 "Token": tok,

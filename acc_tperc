@@ -1,45 +1,54 @@
-import pandas as pd
-import numpy as np
-import matplotlib.pyplot as plt
+# Rebuild predictions_all_levels etc. using existing variables
+# Assumes: dataset_by_strategy, model, tokenizer, id_to_label, label_to_id are already available from prior code
 
-# Assumes: predictions_all_levels, labels_all_levels, word_ids_all_levels, tokens_all_levels
-# Each is a dict[strategy_name] -> list of list (one per sample)
+from tqdm import tqdm
 
-thresholds = np.arange(0.5, 1.05, 0.1)
-threshold_labels = [f"{int(t*100)}%+" for t in thresholds]
-summary_dict = {}
+predictions_all_levels = {}
+labels_all_levels = {}
+word_ids_all_levels = {}
+tokens_all_levels = {}
 
-for strategy in predictions_all_levels:
-    pred_samples = predictions_all_levels[strategy]
-    true_samples = labels_all_levels[strategy]
-    word_id_samples = word_ids_all_levels[strategy]
-    token_samples = tokens_all_levels[strategy]
+# Reuse helper
+def tokenize_and_align_labels(tokenizer, text: str, word_labels: list, label_to_id: dict):
+    tokenized = tokenizer(text, return_offsets_mapping=True, return_tensors='pt', truncation=True, padding='max_length', max_length=64)
+    word_ids = tokenized.word_ids()
+    aligned = []
+    for wid in word_ids:
+        if wid is None:
+            aligned.append(-100)
+        else:
+            label = word_labels[wid] if wid < len(word_labels) else 'O'
+            aligned.append(label_to_id.get(label, label_to_id['O']))
+    return tokenized, aligned
 
-    results = {t: [] for t in thresholds}
+# Main loop
+for strategy_name, dataset in dataset_by_strategy.items():
+    preds, labels, word_ids, tokens = [], [], [], []
+    for sample in tqdm(dataset, desc=strategy_name):
+        text = sample['text']
+        word_labels = sample['word_labels']
+        tokenized = tokenizer(text, return_tensors='pt', return_offsets_mapping=True, truncation=True, padding='max_length', max_length=64)
+        word_id_list = tokenized.word_ids()
+        input_ids = tokenized['input_ids'].to(model.device)
+        attention_mask = tokenized['attention_mask'].to(model.device)
 
-    for preds, trues, wids in zip(pred_samples, true_samples, word_id_samples):
-        word_to_true = {}
-        word_to_pred = {}
-        for p, t, wid in zip(preds, trues, wids):
-            if wid is None or wid == -1:
-                continue
-            word_to_true.setdefault(wid, []).append(t)
-            word_to_pred.setdefault(wid, []).append(p)
-        correct_words = sum(word_to_true[wid] == word_to_pred[wid] for wid in word_to_true)
-        total_words = len(word_to_true)
-        ratio = correct_words / total_words if total_words > 0 else 0
-        for t in thresholds:
-            results[t].append(ratio >= t)
+        with torch.no_grad():
+            output = model(input_ids=input_ids, attention_mask=attention_mask)
+        pred_ids = torch.argmax(output.logits, dim=-1).squeeze().tolist()
 
-    summary_dict[strategy] = [np.mean(results[t]) for t in thresholds]
+        _, label_ids = tokenize_and_align_labels(tokenizer, text, word_labels, label_to_id)
 
-# DataFrame and plot
-summary_df = pd.DataFrame(summary_dict, index=threshold_labels)
-summary_df.plot(kind='bar', figsize=(14, 6), title='Sample-Level Word Accuracy Across Perturbations')
-plt.ylabel('Proportion of Correct Samples')
-plt.xlabel('Minimum % Words Correct per Sample')
-plt.ylim(0, 1)
-plt.xticks(rotation=45)
-plt.grid(True)
-plt.tight_layout()
-plt.show()
+        pred_str = [id_to_label[i] for i, l in zip(pred_ids, label_ids) if l != -100]
+        true_str = [id_to_label[l] for l in label_ids if l != -100]
+        token_words = tokenizer.convert_ids_to_tokens(tokenized['input_ids'].squeeze().tolist())
+        word_ids_cleaned = [wid for i, wid in enumerate(word_id_list) if label_ids[i] != -100]
+
+        preds.append(pred_str)
+        labels.append(true_str)
+        word_ids.append(word_ids_cleaned)
+        tokens.append(token_words)
+
+    predictions_all_levels[strategy_name] = preds
+    labels_all_levels[strategy_name] = labels
+    word_ids_all_levels[strategy_name] = word_ids
+    tokens_all_levels[strategy_name] = tokens

@@ -48,6 +48,19 @@ for strategy_name, dataset in dataset_by_strategy.items():
         word_ids.append(word_ids_cleaned)
         tokens.append(token_words)
 
+dataset_by_strategy = {}
+
+for strategy in strategies:
+    for target in targets:
+        key = f"{strategy}_{target}"
+        if key not in dataset_by_strategy:
+            dataset_by_strategy[key] = []
+        for i in range(min(len(dataset), 500)):  # adjust if needed
+            dataset_by_strategy[key].append({
+                'text': dataset[i]['text'],  # assuming each sample has .text
+                'word_labels': dataset[i]['word_labels']  # assuming word-level labels
+            })
+
     predictions_all_levels[strategy_name] = preds
     labels_all_levels[strategy_name] = labels
     word_ids_all_levels[strategy_name] = word_ids

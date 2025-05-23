@@ -1,155 +1,150 @@
 import torch
+import random
+import re
 import pandas as pd
-from sklearn.metrics import accuracy_score, precision_recall_fscore_support
+from sklearn.metrics import precision_recall_fscore_support, accuracy_score
+import matplotlib.pyplot as plt
 
-def realistic_misspell(token):
-    if token.isalpha() and len(token) > 3:
-        return token[:1] + token[2] + token[1] + token[3:]
-    return token
+# --- Utilities ---
+def is_number(token):
+    return bool(re.match(r"^\d+(\.\d+)?$", token))
 
-def apply_perturbation(words, labels, perturbation_type):
-    perturbed = []
+def apply_perturbation_strategy(word, strategy):
+    if strategy == "misspell" and len(word) > 3:
+        chars = list(word)
+        idx = random.randint(1, len(chars) - 2)
+        chars[idx], chars[idx+1] = chars[idx+1], chars[idx]
+        return "".join(chars)
+    elif strategy == "insert":
+        return word + "x"
+    elif strategy == "combined":
+        return apply_perturbation_strategy(apply_perturbation_strategy(word, "misspell"), "insert")
+    else:
+        return word
+
+# --- Perturb, Tokenize, Align ---
+def perturb_and_align_labels(words, labels, tokenizer, label_to_id, strategy="misspell", target="all"):
+    perturbed_words = []
+    perturbed_labels = []
+
     for word, label in zip(words, labels):
-        if perturbation_type == "Misspelling" and "TICKER" in label:
-            perturbed.append(realistic_misspell(word))
-        else:
-            perturbed.append(word)
-    return perturbed, labels
+        apply = (
+            target == "all" or
+            ("TICKER" in label and target == "ticker") or
+            (is_number(word) and target == "number")
+        )
+        new_word = apply_perturbation_strategy(word, strategy) if apply else word
+        perturbed_words.append(new_word)
+        perturbed_labels.append(label)
 
-def tokenize_and_align_labels(words, label_ids, tokenizer, label_to_id, id_to_label):
-    labels = []
-    for lid in label_ids:
-        if lid == -100:
-            labels.append("O")
-        elif isinstance(lid, str):
-            labels.append(lid)
-        else:
-            labels.append(id_to_label[lid])
+    tokenized = tokenizer(perturbed_words, is_split_into_words=True, return_offsets_mapping=True,
+                          padding="max_length", truncation=True, return_tensors="pt")
+    word_ids = tokenized.word_ids()
+    tokens = tokenizer.convert_ids_to_tokens(tokenized["input_ids"][0])
 
-    encoding = tokenizer(words, is_split_into_words=True, return_tensors="pt", padding="max_length", truncation=True, max_length=64)
-    word_ids = encoding.word_ids()
-    aligned = []
+    aligned_ids = []
     prev_word_idx = None
-
-    for word_idx in word_ids:
+    for idx, word_idx in enumerate(word_ids):
         if word_idx is None:
-            aligned.append(-100)
-        elif word_idx != prev_word_idx:
-            aligned.append(label_to_id.get(labels[word_idx], label_to_id["O"]))
+            aligned_ids.append(-100)
         else:
-            orig_label = labels[word_idx]
-            if orig_label.startswith("B_"):
-                continuation = "I_" + orig_label[2:]
-                aligned.append(label_to_id.get(continuation, label_to_id[orig_label]))
+            label = perturbed_labels[word_idx]
+            if word_idx != prev_word_idx:
+                aligned_ids.append(label_to_id[label])
             else:
-                aligned.append(label_to_id.get(orig_label, label_to_id["O"]))
+                if label.startswith("B_"):
+                    aligned_ids.append(label_to_id.get("I_" + label[2:], label_to_id["O"]))
+                else:
+                    aligned_ids.append(label_to_id[label])
         prev_word_idx = word_idx
 
-    return encoding, aligned
+    return tokenized, aligned_ids, tokens
 
-def evaluate_robustness(dataset, model, tokenizer, id_to_label, label_to_id, perturbation_type="None", n=5, flag_mismatches=True):
+# --- Trace Predictions ---
+def trace_prediction_examples(dataset, model, tokenizer, id_to_label, label_to_id,
+                              strategy="none", target="all", n=3):
+    from IPython.display import display
     model.eval()
-    trace_rows = []
-    all_preds = []
-    all_trues = []
 
-    for i in range(min(n, len(dataset))):
+    for i in range(n):
         sample = dataset[i]
         words = sample["text"].split()
-        label_ids = sample["labels"]
+        original_ids = sample["labels"]
+        original_labels = [id_to_label[l] if l != -100 else "O" for l in original_ids]
 
-        enc_orig, aligned_orig = tokenize_and_align_labels(words, label_ids, tokenizer, label_to_id, id_to_label)
-        labels = [id_to_label[l] if l != -100 else "O" for l in aligned_orig]
-        perturbed_words, perturbed_labels = apply_perturbation(words, labels, perturbation_type)
-        enc_pert, aligned_pert = tokenize_and_align_labels(perturbed_words, label_ids, tokenizer, label_to_id, id_to_label)
+        tokenized, aligned_ids, tokens = perturb_and_align_labels(words, original_labels,
+                                                                  tokenizer, label_to_id,
+                                                                  strategy=strategy,
+                                                                  target=target)
 
-        enc_orig = {k: v.to(model.device) for k, v in enc_orig.items()}
-        enc_pert = {k: v.to(model.device) for k, v in enc_pert.items()}
-
+        input_tensor = {k: v.to(model.device) for k, v in tokenized.items() if k != "offset_mapping"}
         with torch.no_grad():
-            pred_orig = model(**enc_orig).logits.argmax(-1).squeeze().tolist()
-            pred_pert = model(**enc_pert).logits.argmax(-1).squeeze().tolist()
+            preds = torch.argmax(model(**input_tensor).logits, dim=-1)[0].cpu().tolist()
 
-        toks_orig = tokenizer.convert_ids_to_tokens(enc_orig["input_ids"].squeeze())
-        toks_pert = tokenizer.convert_ids_to_tokens(enc_pert["input_ids"].squeeze())
+        result_rows = []
+        for j, (tok, tid, pid) in enumerate(zip(tokens, aligned_ids, preds)):
+            if tok in ["[CLS]", "[SEP]", "[PAD]"] or tid == -100:
+                continue
+            result_rows.append({
+                "Idx": j,
+                "Token": tok,
+                "True Label": id_to_label.get(tid, "?"),
+                "Pred Label": id_to_label.get(pid, "?")
+            })
 
-        mask = [l != -100 for l in aligned_orig]
-        true_flat = [l for l in aligned_orig if l != -100]
-        pred_flat = [p for p, m in zip(pred_pert, mask) if m]
-        all_trues.extend(true_flat)
-        all_preds.extend(pred_flat)
+        print(f"\n=== Sample {i} (strategy: {strategy}) ===")
+        print("Original Text: ", " ".join(words))
+        display(pd.DataFrame(result_rows))
 
-        mismatch_flags = [("❌" if p != t else "✅") if m else "" for p, t, m in zip(pred_pert, aligned_orig, mask)]
+# --- Run All Experiments ---
+def run_perturbation_experiments(dataset, model, tokenizer, id_to_label, label_to_id, n_samples=100):
+    configs = [
+        ("none", "all"),
+        ("misspell", "all"),
+        ("insert", "all"),
+        ("combined", "all"),
+        ("misspell", "ticker"),
+        ("insert", "ticker"),
+        ("misspell", "number")
+    ]
 
-        trace_rows.append({
-            "Sample Index": i,
-            "Perturbation": perturbation_type,
-            "Original Text": sample["text"],
-            "Perturbed Text": " ".join(perturbed_words),
-            "Original Tokens": list(toks_orig),
-            "Perturbed Tokens": list(toks_pert),
-            "True Labels": [id_to_label.get(l, "O") if l != -100 else "O" for l in aligned_orig],
-            "Pred Orig": [id_to_label.get(p, "O") for p in pred_orig],
-            "Pred Pert": [id_to_label.get(p, "O") for p in pred_pert],
-            "Mismatch": mismatch_flags if flag_mismatches else None
-        })
+    results = {}
+    for strategy, target in configs:
+        print(f"Running: {strategy}_{target}")
+        y_true_all = []
+        y_pred_all = []
+        for i in range(min(n_samples, len(dataset))):
+            sample = dataset[i]
+            words = sample["text"].split()
+            original_ids = sample["labels"]
+            original_labels = [id_to_label[l] if l != -100 else "O" for l in original_ids]
+            encoding, aligned_ids, _ = perturb_and_align_labels(words, original_labels, tokenizer, label_to_id, strategy, target)
 
-    precision, recall, f1, _ = precision_recall_fscore_support(all_trues, all_preds, average="weighted", zero_division=0)
-    accuracy = accuracy_score(all_trues, all_preds)
+            input_tensor = {k: v.to(model.device) for k, v in encoding.items() if k != "offset_mapping"}
+            with torch.no_grad():
+                preds = torch.argmax(model(**input_tensor).logits, dim=-1)[0].cpu().tolist()
 
-    metrics = {
-        "Accuracy": round(accuracy, 4),
-        "Precision": round(precision, 4),
-        "Recall": round(recall, 4),
-        "F1 Score": round(f1, 4)
-    }
+            for t, p in zip(aligned_ids, preds):
+                if t != -100:
+                    y_true_all.append(t)
+                    y_pred_all.append(p)
 
-    return pd.DataFrame(trace_rows), metrics
+        prec, recall, f1, _ = precision_recall_fscore_support(y_true_all, y_pred_all, average="weighted", zero_division=0)
+        acc = accuracy_score(y_true_all, y_pred_all)
+        results[f"{strategy}_{target}"] = {
+            "Accuracy": round(acc, 4),
+            "Precision": round(prec, 4),
+            "Recall": round(recall, 4),
+            "F1": round(f1, 4)
+        }
 
-df_trace, metrics = evaluate_robustness(
-    dataset=dataset,                     # your HF-style dataset
-    model=model,                         # your pretrained model
-    tokenizer=tokenizer,                 # your tokenizer (AutoTokenizer)
-    id_to_label=id_to_label,             # {int: str}
-    label_to_id=label_to_id,             # {str: int}
-    perturbation_type="None",            # or "Misspelling"
-    n=5,                                 # number of samples to trace
-    flag_mismatches=True
-)
-
-def print_trace_samples(df_trace, n=3):
-    for i, row in df_trace.head(n).iterrows():
-        print(f"\n=== Sample {row['Sample Index']} ({row['Perturbation']}) ===")
-        print(f"Original Text:   {row['Original Text']}")
-        print(f"Perturbed Text:  {row['Perturbed Text']}\n")
-        print(f"{'Idx':<4} {'OrigTok':<15} {'PertTok':<15} {'TrueLabel':<15} {'PredOrig':<15} {'PredPert':<15} {'Match'}")
-        print("-" * 90)
-        for j in range(min(len(row['Original Tokens']), len(row['Perturbed Tokens']))):
-            tok_o = row['Original Tokens'][j]
-            tok_p = row['Perturbed Tokens'][j]
-            lbl_t = row['True Labels'][j]
-            pred_o = row['Pred Orig'][j]
-            pred_p = row['Pred Pert'][j]
-            match = row['Mismatch'][j] if row['Mismatch'] else ""
-            print(f"{j:<4} {tok_o:<15} {tok_p:<15} {lbl_t:<15} {pred_o:<15} {pred_p:<15} {match}")
-
-print("\n=== Overall Metrics ===")
-for k, v in metrics.items():
-    print(f"{k}: {v}")
-
-
-df_trace, metrics = evaluate_robustness(
-    dataset=dataset,
-    model=model,
-    tokenizer=tokenizer,
-    id_to_label=id_to_label,
-    label_to_id=label_to_id,
-    perturbation_type="Misspelling",
-    n=5
-)
-
-print_trace_samples(df_trace, n=3)
-
-print("\n=== Metrics ===")
-for k, v in metrics.items():
-    print(f"{k}: {v}")
+    df = pd.DataFrame(results).T
+    df.plot(kind="bar", figsize=(12, 6))
+    plt.title("Performance under different perturbation strategies")
+    plt.ylabel("Score")
+    plt.ylim(0, 1)
+    plt.xticks(rotation=45)
+    plt.grid(True)
+    plt.tight_layout()
+    plt.show()
+    return df

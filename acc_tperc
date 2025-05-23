@@ -1,0 +1,45 @@
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+
+# Assumes: predictions_all_levels, labels_all_levels, word_ids_all_levels, tokens_all_levels
+# Each is a dict[strategy_name] -> list of list (one per sample)
+
+thresholds = np.arange(0.5, 1.05, 0.1)
+threshold_labels = [f"{int(t*100)}%+" for t in thresholds]
+summary_dict = {}
+
+for strategy in predictions_all_levels:
+    pred_samples = predictions_all_levels[strategy]
+    true_samples = labels_all_levels[strategy]
+    word_id_samples = word_ids_all_levels[strategy]
+    token_samples = tokens_all_levels[strategy]
+
+    results = {t: [] for t in thresholds}
+
+    for preds, trues, wids in zip(pred_samples, true_samples, word_id_samples):
+        word_to_true = {}
+        word_to_pred = {}
+        for p, t, wid in zip(preds, trues, wids):
+            if wid is None or wid == -1:
+                continue
+            word_to_true.setdefault(wid, []).append(t)
+            word_to_pred.setdefault(wid, []).append(p)
+        correct_words = sum(word_to_true[wid] == word_to_pred[wid] for wid in word_to_true)
+        total_words = len(word_to_true)
+        ratio = correct_words / total_words if total_words > 0 else 0
+        for t in thresholds:
+            results[t].append(ratio >= t)
+
+    summary_dict[strategy] = [np.mean(results[t]) for t in thresholds]
+
+# DataFrame and plot
+summary_df = pd.DataFrame(summary_dict, index=threshold_labels)
+summary_df.plot(kind='bar', figsize=(14, 6), title='Sample-Level Word Accuracy Across Perturbations')
+plt.ylabel('Proportion of Correct Samples')
+plt.xlabel('Minimum % Words Correct per Sample')
+plt.ylim(0, 1)
+plt.xticks(rotation=45)
+plt.grid(True)
+plt.tight_layout()
+plt.show()

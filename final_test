@@ -7,19 +7,17 @@ import matplotlib.pyplot as plt
 from tqdm import tqdm
 import torch
 
-# Perturb individual word
+# --- Perturbation Utilities ---
+
 def perturb_word(word: str, strategy: str) -> str:
-    if strategy == "misspell":
-        if len(word) > 1:
-            i = random.randint(0, len(word)-2)
-            return word[:i] + word[i+1] + word[i] + word[i+2:]
-    elif strategy == "insert":
-        if len(word) > 0:
-            i = random.randint(0, len(word)-1)
-            return word[:i] + random.choice("xyz") + word[i:]
+    if strategy == "misspell" and len(word) > 1:
+        i = random.randint(0, len(word) - 2)
+        return word[:i] + word[i+1] + word[i] + word[i+2:]
+    elif strategy == "insert" and len(word) > 0:
+        i = random.randint(0, len(word))
+        return word[:i] + random.choice("xyz") + word[i:]
     return word
 
-# Apply perturbation to sentence
 def perturb_text(text: str, strategy: str, target: str) -> str:
     words = text.split()
     perturbed = []
@@ -32,7 +30,8 @@ def perturb_text(text: str, strategy: str, target: str) -> str:
             perturbed.append(word)
     return " ".join(perturbed)
 
-# Align labels from word to token space
+# --- Tokenization & Label Alignment ---
+
 def tokenize_and_align_labels(tokenizer, text: str, word_labels: List[str], label_to_id: dict):
     tokenized = tokenizer(text, return_offsets_mapping=True, return_tensors='pt', truncation=True, padding='max_length', max_length=64)
     word_ids = tokenized.word_ids()
@@ -41,11 +40,12 @@ def tokenize_and_align_labels(tokenizer, text: str, word_labels: List[str], labe
         if wid is None:
             aligned.append(-100)
         else:
-            label = word_labels[wid]
+            label = word_labels[wid] if wid < len(word_labels) else 'O'
             aligned.append(label_to_id.get(label, label_to_id['O']))
     return tokenized, aligned
 
-# Evaluate one sample
+# --- Evaluation ---
+
 def evaluate_case(model, tokenizer, text: str, word_labels: List[str], label_to_id: dict, id_to_label: dict):
     tokenized, aligned_labels = tokenize_and_align_labels(tokenizer, text, word_labels, label_to_id)
     input_ids = tokenized['input_ids'].to(model.device)
@@ -67,7 +67,8 @@ def evaluate_case(model, tokenizer, text: str, word_labels: List[str], label_to_
         "f1": f1_score(true_names, pred_names, average="weighted", zero_division=0),
     }
 
-# Run experiment grid
+# --- Experiment Runner ---
+
 def run_experiments(dataset, model, tokenizer, id_to_label, label_to_id, strategies, targets, n_samples=200):
     records = []
     for strategy in strategies:
@@ -76,7 +77,20 @@ def run_experiments(dataset, model, tokenizer, id_to_label, label_to_id, strateg
             metrics_list = []
             for i in tqdm(range(min(n_samples, len(dataset)))):
                 text = dataset[i]['text']
-                word_labels = [id_to_label[lid] for lid in dataset[i]['labels'] if lid != -100]
+                
+                # Developer-style word label reconstruction
+                tokenized = tokenizer(text)
+                word_ids = tokenized.word_ids()
+                token_labels = dataset[i]['labels']
+                max_word_id = max(wid for wid in word_ids if wid is not None)
+                word_labels = ['O'] * (max_word_id + 1)
+                for lid, wid in zip(token_labels, word_ids):
+                    if wid is None or lid == -100:
+                        continue
+                    label_str = id_to_label[lid]
+                    if word_labels[wid] == 'O' or label_str.startswith('B_'):
+                        word_labels[wid] = label_str
+
                 if strategy != "none":
                     text = perturb_text(text, strategy, target)
                 metrics = evaluate_case(model, tokenizer, text, word_labels, label_to_id, id_to_label)
@@ -86,7 +100,8 @@ def run_experiments(dataset, model, tokenizer, id_to_label, label_to_id, strateg
             records.append(avg_metrics)
     return pd.DataFrame(records)
 
-# Plot results
+# --- Plotting ---
+
 def plot_results(df: pd.DataFrame):
     df.set_index("strategy")[["accuracy", "precision", "recall", "f1"]].plot(kind="bar", figsize=(14,6), title="Performance under different perturbation strategies")
     plt.ylabel("Score")

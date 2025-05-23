@@ -3,167 +3,102 @@ import random
 import re
 import pandas as pd
 from sklearn.metrics import precision_recall_fscore_support, accuracy_score
+import matplotlib.pyplot as plt
 
 # --- Utilities ---
 def is_number(token):
     return bool(re.match(r"^\d+(\.\d+)?$", token))
 
-def apply_perturbation_strategy(token, strategy):
-    if strategy == "misspell" and len(token) > 3:
-        chars = list(token)
+def apply_perturbation_strategy(word, strategy):
+    if strategy == "misspell" and len(word) > 3:
+        chars = list(word)
         idx = random.randint(1, len(chars) - 2)
         chars[idx], chars[idx+1] = chars[idx+1], chars[idx]
         return "".join(chars)
     elif strategy == "insert":
-        return f"{token} x"
+        return word + "x"
     elif strategy == "combined":
-        return apply_perturbation_strategy(apply_perturbation_strategy(token, "misspell"), "insert")
+        return apply_perturbation_strategy(apply_perturbation_strategy(word, "misspell"), "insert")
     else:
-        return token
+        return word
 
-# --- Perturbation + Alignment ---
-def advanced_perturb_tokens(words, labels, tokenizer, label_to_id, strategy="misspell", target="all"):
-    perturbed_tokens = []
-    new_labels = []
+# --- Advanced Perturbation + Token-level Label Alignment ---
+def perturb_and_tokenize(words, labels, tokenizer, label_to_id, strategy="misspell", target="all"):
+    perturbed_words = []
+    perturbed_labels = []
 
     for word, label in zip(words, labels):
-        apply = (
+        should_perturb = (
             target == "all" or
             (target == "ticker" and "TICKER" in label) or
             (target == "number" and is_number(word))
         )
 
-        if apply:
-            perturbed = apply_perturbation_strategy(word, strategy).split()
-            perturbed_tokens.extend(perturbed)
-            new_labels.extend([label] + ["O"] * (len(perturbed) - 1))
-        else:
-            perturbed_tokens.append(word)
-            new_labels.append(label)
+        new_word = apply_perturbation_strategy(word, strategy) if should_perturb else word
+        tokens = tokenizer.tokenize(new_word)
 
-    encoding = tokenizer(perturbed_tokens, is_split_into_words=True, return_tensors="pt",
+        if not tokens:
+            continue  # skip empty tokens
+
+        # assign correct BIO tag propagation
+        label_ids = [label_to_id[label]]
+        for _ in tokens[1:]:
+            if label.startswith("B_"):
+                label_ids.append(label_to_id.get("I_" + label[2:], label_to_id["O"]))
+            else:
+                label_ids.append(label_to_id.get(label, label_to_id["O"]))
+
+        perturbed_words.extend(tokens)
+        perturbed_labels.extend(label_ids)
+
+    encoding = tokenizer(perturbed_words, is_split_into_words=False, return_tensors="pt",
                          padding="max_length", truncation=True, max_length=64)
     word_ids = encoding.word_ids()
 
     aligned_labels = []
-    prev_word_idx = None
+    token_cursor = 0
     for word_idx in word_ids:
         if word_idx is None:
             aligned_labels.append(-100)
         else:
-            tag = new_labels[word_idx]
-            if word_idx != prev_word_idx:
-                aligned_labels.append(label_to_id.get(tag, label_to_id["O"]))
+            if token_cursor < len(perturbed_labels):
+                aligned_labels.append(perturbed_labels[token_cursor])
+                token_cursor += 1
             else:
-                tag = "I_" + tag[2:] if tag.startswith("B_") else tag
-                aligned_labels.append(label_to_id.get(tag, label_to_id["O"]))
-        prev_word_idx = word_idx
+                aligned_labels.append(label_to_id["O"])
 
-    return encoding, aligned_labels
+    return encoding, aligned_labels, perturbed_words
 
-# --- Evaluation ---
-def evaluate_advanced(dataset, model, tokenizer, id_to_label, label_to_id,
-                      strategy="none", target="all", n_samples=100):
+# --- Trace Predictions ---
+def trace_prediction_examples(dataset, model, tokenizer, id_to_label, label_to_id, strategy="none", target="all", n=3):
+    from IPython.display import display
     model.eval()
-    true_labels, pred_labels = [], []
-    entity_stats = {}
 
-    for i in range(min(n_samples, len(dataset))):
+    for i in range(n):
         sample = dataset[i]
         words = sample["text"].split()
         label_ids = sample["labels"]
-        labels_str = [id_to_label.get(lid, "O") if lid != -100 else "O" for lid in label_ids]
+        label_strs = [id_to_label.get(l, "O") if l != -100 else "O" for l in label_ids]
 
-        if strategy == "none":
-            input_ids = sample["input_ids"]
-            attention_mask = sample["attention_mask"]
-            aligned = label_ids
-            encoding = {
-                "input_ids": torch.tensor([input_ids]),
-                "attention_mask": torch.tensor([attention_mask])
-            }
-        else:
-            encoding, aligned = advanced_perturb_tokens(words, labels_str, tokenizer, label_to_id, strategy, target)
-
+        encoding, aligned, tokens = perturb_and_tokenize(words, label_strs, tokenizer, label_to_id, strategy, target)
         input_tensor = {k: v.to(model.device) for k, v in encoding.items()}
+
         with torch.no_grad():
             logits = model(**input_tensor).logits.squeeze()
             predictions = torch.argmax(logits, dim=-1).cpu().tolist()
 
-        for pred, true in zip(predictions, aligned):
-            if true != -100:
-                pred_labels.append(pred)
-                true_labels.append(true)
+        decoded_tokens = tokenizer.convert_ids_to_tokens(encoding["input_ids"][0])
 
-                ent = id_to_label[true]
-                if ent not in entity_stats:
-                    entity_stats[ent] = {"y_true": [], "y_pred": []}
-                entity_stats[ent]["y_true"].append(true)
-                entity_stats[ent]["y_pred"].append(pred)
+        result_rows = []
+        for idx, (tok, true_id, pred_id) in enumerate(zip(decoded_tokens, aligned, predictions)):
+            if tok in ["[CLS]", "[SEP]", "[PAD]"] or true_id == -100:
+                continue
+            result_rows.append({
+                "Idx": idx,
+                "Token": tok,
+                "True Label": id_to_label.get(true_id, "?"),
+                "Pred Label": id_to_label.get(pred_id, "?")
+            })
 
-    precision, recall, f1, _ = precision_recall_fscore_support(true_labels, pred_labels, average="weighted", zero_division=0)
-    accuracy = accuracy_score(true_labels, pred_labels)
-
-    overall_metrics = {
-        "Accuracy": round(accuracy, 4),
-        "Precision": round(precision, 4),
-        "Recall": round(recall, 4),
-        "F1 Score": round(f1, 4)
-    }
-
-    per_entity = {}
-    for ent, data in entity_stats.items():
-        p, r, f, _ = precision_recall_fscore_support(data["y_true"], data["y_pred"], average="weighted", zero_division=0)
-        per_entity[ent] = {"Precision": round(p, 4), "Recall": round(r, 4), "F1": round(f, 4)}
-
-    return overall_metrics, pd.DataFrame(per_entity).T
-
-# --- Multi-config Runner ---
-def run_advanced_robustness(dataset, model, tokenizer, id_to_label, label_to_id, n_samples=100):
-    configs = [
-        ("none", "all"),
-        ("misspell", "all"),
-        ("insert", "all"),
-        ("combined", "all"),
-        ("misspell", "ticker"),
-        ("insert", "ticker"),
-        ("misspell", "number")
-    ]
-
-    summary = {}
-    per_entity_dfs = {}
-
-    for strategy, target in configs:
-        label = f"{strategy}_{target}"
-        print(f"Running: {label}")
-        overall, per_entity = evaluate_advanced(
-            dataset=dataset,
-            model=model,
-            tokenizer=tokenizer,
-            id_to_label=id_to_label,
-            label_to_id=label_to_id,
-            strategy=strategy,
-            target=target,
-            n_samples=n_samples
-        )
-        summary[label] = overall
-        per_entity_dfs[label] = per_entity
-
-    return pd.DataFrame(summary).T, per_entity_dfs
-
-# --- Plotting ---
-def plot_per_entity_f1(df_by_entity):
-    all_f1s = pd.DataFrame({cfg: df["F1"] for cfg, df in df_by_entity.items()}).fillna(0)
-    all_f1s = all_f1s.loc[all_f1s.mean(axis=1).sort_values(ascending=False).index]
-    all_f1s.T.plot(kind="bar", figsize=(14, 6))
-    plt.title("Entity-Level F1 Scores Across Perturbation Strategies")
-    plt.ylabel("F1 Score")
-    plt.ylim(0, 1)
-    plt.xticks(rotation=45)
-    plt.legend(title="Entity", bbox_to_anchor=(1.05, 1), loc='upper left')
-    plt.tight_layout()
-    plt.show()
-
-# --- Usage Example ---
-# df_summary, df_by_entity = run_advanced_robustness(dataset, model, tokenizer, id_to_label, label_to_id, n_samples=100)
-# plot_per_entity_f1(df_by_entity)
+        print(f"\n=== Sample {i} (strategy: {strategy}) ===")
+        display(pd.DataFrame(result_rows))

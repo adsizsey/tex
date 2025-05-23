@@ -19,6 +19,7 @@ def evaluate_robustness_fixed_trace(dataset, model, tokenizer, id_to_label, labe
         return perturbed, labels
 
     def tokenize_and_align_labels(words, label_ids, tokenizer, label_to_id, id_to_label):
+        # Step 1: Convert label_ids to label strings
         labels = []
         for lid in label_ids:
             if lid == -100:
@@ -28,8 +29,10 @@ def evaluate_robustness_fixed_trace(dataset, model, tokenizer, id_to_label, labe
             else:
                 labels.append(id_to_label[lid])
 
+        # Step 2: Tokenize and get word_id map
         encoding = tokenizer(words, is_split_into_words=True, return_tensors="pt", padding="max_length", truncation=True, max_length=64)
         word_ids = encoding.word_ids()
+
         aligned = []
         aligned_text = []
         prev_word_idx = None
@@ -38,21 +41,23 @@ def evaluate_robustness_fixed_trace(dataset, model, tokenizer, id_to_label, labe
             if word_idx is None:
                 aligned.append(-100)
                 aligned_text.append("O")
-            elif word_idx != prev_word_idx:
-                label_id = label_to_id.get(labels[word_idx], label_to_id["O"])
-                aligned.append(label_id)
-                aligned_text.append(labels[word_idx])
+                continue
+
+            orig_label = labels[word_idx]
+
+            # First token of a word
+            if word_idx != prev_word_idx:
+                aligned_label = orig_label
             else:
-                orig_label = labels[word_idx]
                 if orig_label.startswith("B_"):
-                    continuation = "I_" + orig_label[2:]
-                    label_id = label_to_id.get(continuation, label_to_id[orig_label])
-                    aligned.append(label_id)
-                    aligned_text.append(continuation)
+                    aligned_label = "I_" + orig_label[2:]
+                elif orig_label.startswith("I_") or orig_label != "O":
+                    aligned_label = orig_label
                 else:
-                    label_id = label_to_id.get(orig_label, label_to_id["O"])
-                    aligned.append(label_id)
-                    aligned_text.append(orig_label)
+                    aligned_label = "O"
+
+            aligned.append(label_to_id.get(aligned_label, label_to_id["O"]))
+            aligned_text.append(aligned_label)
             prev_word_idx = word_idx
 
         return encoding, aligned, aligned_text
@@ -67,9 +72,14 @@ def evaluate_robustness_fixed_trace(dataset, model, tokenizer, id_to_label, labe
         words = sample["text"].split()
         label_ids = sample["labels"]
 
+        # Encode original
         enc_orig, aligned_orig, aligned_orig_text = tokenize_and_align_labels(words, label_ids, tokenizer, label_to_id, id_to_label)
-        labels_word_level = [id_to_label[l] if l != -100 else "O" for l in label_ids]
-        perturbed_words, perturbed_labels = apply_perturbation(words, labels_word_level, perturbation_type)
+
+        # Perturbation
+        word_level_labels = [id_to_label[l] if l != -100 else "O" for l in label_ids]
+        perturbed_words, _ = apply_perturbation(words, word_level_labels, perturbation_type)
+
+        # Encode perturbed
         enc_pert, aligned_pert, _ = tokenize_and_align_labels(perturbed_words, label_ids, tokenizer, label_to_id, id_to_label)
 
         enc_orig = {k: v.to(model.device) for k, v in enc_orig.items()}
@@ -95,9 +105,9 @@ def evaluate_robustness_fixed_trace(dataset, model, tokenizer, id_to_label, labe
             "Perturbation": perturbation_type,
             "Original Text": sample["text"],
             "Perturbed Text": " ".join(perturbed_words),
-            "Original Tokens": list(toks_orig),
-            "Perturbed Tokens": list(toks_pert),
-            "True Labels": aligned_orig_text,  # ✅ fixed
+            "Original Tokens": toks_orig,
+            "Perturbed Tokens": toks_pert,
+            "True Labels": aligned_orig_text,
             "Pred Orig": [id_to_label.get(p, "O") for p in pred_orig],
             "Pred Pert": [id_to_label.get(p, "O") for p in pred_pert],
             "Mismatch": mismatch_flags if flag_mismatches else None

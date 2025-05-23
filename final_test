@@ -16,21 +16,36 @@ def apply_perturbation(words, labels, perturbation_type):
             perturbed.append(word)
     return perturbed, labels
 
-def tokenize_and_align_labels(words, labels, tokenizer, label_to_id):
-    enc = tokenizer(words, is_split_into_words=True, return_tensors="pt", padding="max_length", truncation=True, max_length=64)
-    word_ids = enc.word_ids()
-    aligned = []
-    prev_wid = None
-    for wid in word_ids:
-        if wid is None:
-            aligned.append(-100)
-        elif wid != prev_wid:
-            aligned.append(label_to_id[labels[wid]])
+def tokenize_and_align_labels(words, label_ids, tokenizer, label_to_id, id_to_label):
+    labels = []
+    for lid in label_ids:
+        if lid == -100:
+            labels.append("O")
+        elif isinstance(lid, str):
+            labels.append(lid)
         else:
-            lbl = label_to_id[labels[wid]]
-            aligned.append(lbl if id_to_label[lbl].startswith("I_") else lbl)
-        prev_wid = wid
-    return enc, aligned
+            labels.append(id_to_label[lid])
+
+    encoding = tokenizer(words, is_split_into_words=True, return_tensors="pt", padding="max_length", truncation=True, max_length=64)
+    word_ids = encoding.word_ids()
+    aligned = []
+    prev_word_idx = None
+
+    for word_idx in word_ids:
+        if word_idx is None:
+            aligned.append(-100)
+        elif word_idx != prev_word_idx:
+            aligned.append(label_to_id.get(labels[word_idx], label_to_id["O"]))
+        else:
+            orig_label = labels[word_idx]
+            if orig_label.startswith("B_"):
+                continuation = "I_" + orig_label[2:]
+                aligned.append(label_to_id.get(continuation, label_to_id[orig_label]))
+            else:
+                aligned.append(label_to_id.get(orig_label, label_to_id["O"]))
+        prev_word_idx = word_idx
+
+    return encoding, aligned
 
 def evaluate_robustness(dataset, model, tokenizer, id_to_label, label_to_id, perturbation_type="None", n=5, flag_mismatches=True):
     model.eval()
@@ -41,12 +56,15 @@ def evaluate_robustness(dataset, model, tokenizer, id_to_label, label_to_id, per
     for i in range(min(n, len(dataset))):
         sample = dataset[i]
         words = sample["text"].split()
-        labels = [id_to_label[l] for l in sample["labels"]]
+        label_ids = sample["labels"]
 
+        enc_orig, aligned_orig = tokenize_and_align_labels(words, label_ids, tokenizer, label_to_id, id_to_label)
+        labels = [id_to_label[l] if l != -100 else "O" for l in aligned_orig]
         perturbed_words, perturbed_labels = apply_perturbation(words, labels, perturbation_type)
+        enc_pert, aligned_pert = tokenize_and_align_labels(perturbed_words, label_ids, tokenizer, label_to_id, id_to_label)
 
-        enc_orig, aligned_orig = tokenize_and_align_labels(words, labels, tokenizer, label_to_id)
-        enc_pert, aligned_pert = tokenize_and_align_labels(perturbed_words, perturbed_labels, tokenizer, label_to_id)
+        enc_orig = {k: v.to(model.device) for k, v in enc_orig.items()}
+        enc_pert = {k: v.to(model.device) for k, v in enc_pert.items()}
 
         with torch.no_grad():
             pred_orig = model(**enc_orig).logits.argmax(-1).squeeze().tolist()
@@ -88,6 +106,37 @@ def evaluate_robustness(dataset, model, tokenizer, id_to_label, label_to_id, per
 
     return pd.DataFrame(trace_rows), metrics
 
+df_trace, metrics = evaluate_robustness(
+    dataset=dataset,                     # your HF-style dataset
+    model=model,                         # your pretrained model
+    tokenizer=tokenizer,                 # your tokenizer (AutoTokenizer)
+    id_to_label=id_to_label,             # {int: str}
+    label_to_id=label_to_id,             # {str: int}
+    perturbation_type="None",            # or "Misspelling"
+    n=5,                                 # number of samples to trace
+    flag_mismatches=True
+)
+
+def print_trace_samples(df_trace, n=3):
+    for i, row in df_trace.head(n).iterrows():
+        print(f"\n=== Sample {row['Sample Index']} ({row['Perturbation']}) ===")
+        print(f"Original Text:   {row['Original Text']}")
+        print(f"Perturbed Text:  {row['Perturbed Text']}\n")
+        print(f"{'Idx':<4} {'OrigTok':<15} {'PertTok':<15} {'TrueLabel':<15} {'PredOrig':<15} {'PredPert':<15} {'Match'}")
+        print("-" * 90)
+        for j in range(min(len(row['Original Tokens']), len(row['Perturbed Tokens']))):
+            tok_o = row['Original Tokens'][j]
+            tok_p = row['Perturbed Tokens'][j]
+            lbl_t = row['True Labels'][j]
+            pred_o = row['Pred Orig'][j]
+            pred_p = row['Pred Pert'][j]
+            match = row['Mismatch'][j] if row['Mismatch'] else ""
+            print(f"{j:<4} {tok_o:<15} {tok_p:<15} {lbl_t:<15} {pred_o:<15} {pred_p:<15} {match}")
+
+print("\n=== Overall Metrics ===")
+for k, v in metrics.items():
+    print(f"{k}: {v}")
+
 
 df_trace, metrics = evaluate_robustness(
     dataset=dataset,
@@ -95,9 +144,12 @@ df_trace, metrics = evaluate_robustness(
     tokenizer=tokenizer,
     id_to_label=id_to_label,
     label_to_id=label_to_id,
-    perturbation_type="None",  # or "Misspelling"
+    perturbation_type="Misspelling",
     n=5
 )
 
-print(df_trace.to_string())
-print("\nMetrics:", metrics)
+print_trace_samples(df_trace, n=3)
+
+print("\n=== Metrics ===")
+for k, v in metrics.items():
+    print(f"{k}: {v}")

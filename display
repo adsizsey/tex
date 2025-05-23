@@ -1,0 +1,38 @@
+import pandas as pd
+
+# --- Run the robustness evaluation ---
+df_trace, metrics = evaluate_robustness_fixed_trace(
+    dataset=dataset,
+    model=model,
+    tokenizer=tokenizer,
+    id_to_label=id_to_label,
+    label_to_id=label_to_id,
+    perturbation_type="Misspelling",  # or "None"
+    n=5,
+    flag_mismatches=True
+)
+
+# --- Print the metrics ---
+print("\n=== Overall Metrics ===")
+for k, v in metrics.items():
+    print(f"{k:<10}: {v:.4f}")
+
+# --- Print nicely aligned token-level trace ---
+def print_trace_samples(df_trace, n=3):
+    for i, row in df_trace.head(n).iterrows():
+        print(f"\n=== Sample {row['Sample Index']} ({row['Perturbation']}) ===")
+        print(f"Original Text:   {row['Original Text']}")
+        print(f"Perturbed Text:  {row['Perturbed Text']}\n")
+        print(f"{'Idx':<4} {'OrigTok':<15} {'PertTok':<15} {'TrueLabel':<15} {'PredOrig':<15} {'PredPert':<15} {'Match'}")
+        print("-" * 90)
+        for j in range(min(len(row['Original Tokens']), len(row['Perturbed Tokens']))):
+            tok_o = row['Original Tokens'][j]
+            tok_p = row['Perturbed Tokens'][j]
+            lbl_t = row['True Labels'][j]
+            pred_o = row['Pred Orig'][j]
+            pred_p = row['Pred Pert'][j]
+            match = row['Mismatch'][j] if row['Mismatch'] else ""
+            print(f"{j:<4} {tok_o:<15} {tok_p:<15} {lbl_t:<15} {pred_o:<15} {pred_p:<15} {match}")
+
+# --- Print first few sample traces ---
+print_trace_samples(df_trace, n=3)

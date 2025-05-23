@@ -1,0 +1,47 @@
+def developer_style_token_alignment(sample, tokenizer, label_to_id, id_to_label, max_length=64):
+    """
+    Mimics developer's method: aligns original labels to tokenized input
+    without overcomplicated transformation.
+    Returns tokenized input, token-level label IDs (with -100 for specials), and readable labels.
+    """
+    words = sample["text"].split()
+    label_ids = sample["labels"]
+
+    encoding = tokenizer(words, is_split_into_words=True, return_tensors="pt", padding="max_length", truncation=True, max_length=max_length)
+    word_ids = encoding.word_ids()
+
+    aligned_ids = []
+    readable_labels = []
+    prev_word = None
+
+    for idx, word_id in enumerate(word_ids):
+        if word_id is None:
+            aligned_ids.append(-100)
+            readable_labels.append("O")
+        elif word_id != prev_word:
+            lid = label_ids[word_id]
+            aligned_ids.append(lid)
+            readable_labels.append(id_to_label.get(lid, "O"))
+        else:
+            lid = label_ids[word_id]
+            # Use continuation only if original was B_
+            if id_to_label.get(lid, "O").startswith("B_"):
+                continuation = "I_" + id_to_label[lid][2:]
+                aligned_ids.append(label_to_id.get(continuation, lid))
+                readable_labels.append(continuation)
+            else:
+                aligned_ids.append(lid)
+                readable_labels.append(id_to_label.get(lid, "O"))
+        prev_word = word_id
+
+    return encoding, aligned_ids, readable_labels
+
+enc, label_ids, label_names = developer_style_token_alignment(
+    sample=dataset[0],
+    tokenizer=tokenizer,
+    label_to_id=label_to_id,
+    id_to_label=id_to_label
+)
+
+print(tokenizer.convert_ids_to_tokens(enc["input_ids"][0]))
+print(label_names)

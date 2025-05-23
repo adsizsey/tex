@@ -1,0 +1,90 @@
+import torch
+import pandas as pd
+import matplotlib.pyplot as plt
+from sklearn.metrics import accuracy_score, precision_recall_fscore_support
+
+def evaluate_with_existing_alignment(dataset, model, id_to_label, tokenizer, perturb_fn=None, n_samples=100):
+    model.eval()
+    true_labels, pred_labels = [], []
+    trace_rows = []
+
+    for i in range(min(n_samples, len(dataset))):
+        sample = dataset[i]
+        input_ids = sample["input_ids"]
+        attention_mask = sample["attention_mask"]
+        labels = sample["labels"]
+
+        if perturb_fn:
+            input_ids, labels = perturb_fn(input_ids, labels)
+
+        input_tensor = {
+            "input_ids": torch.tensor([input_ids], dtype=torch.long).to(model.device),
+            "attention_mask": torch.tensor([attention_mask], dtype=torch.long).to(model.device)
+        }
+
+        with torch.no_grad():
+            logits = model(**input_tensor).logits.squeeze()
+            predictions = torch.argmax(logits, dim=-1).cpu().tolist()
+
+        # Evaluate only where labels != -100
+        for tid, pid, lid in zip(input_ids, predictions, labels):
+            if lid != -100:
+                true_labels.append(lid)
+                pred_labels.append(pid)
+
+        trace_rows.append({
+            "Tokens": tokenizer.convert_ids_to_tokens(input_ids),
+            "True Labels": [id_to_label.get(l, 'O') if l != -100 else '-' for l in labels],
+            "Pred Labels": [id_to_label.get(p, 'O') for p in predictions]
+        })
+
+    precision, recall, f1, _ = precision_recall_fscore_support(true_labels, pred_labels, average="weighted", zero_division=0)
+    accuracy = accuracy_score(true_labels, pred_labels)
+
+    metrics = {
+        "Accuracy": round(accuracy, 4),
+        "Precision": round(precision, 4),
+        "Recall": round(recall, 4),
+        "F1 Score": round(f1, 4)
+    }
+
+    return pd.DataFrame(trace_rows), metrics
+
+
+def plot_metrics(metrics_dict):
+    df = pd.DataFrame(metrics_dict, index=["Score"]).T
+    df.plot(kind="bar", legend=False, figsize=(7, 4), ylim=(0, 1))
+    plt.title("Model Performance")
+    plt.ylabel("Score")
+    for i, v in enumerate(df["Score"]):
+        plt.text(i, v + 0.01, f"{v:.2f}", ha='center')
+    plt.tight_layout()
+    plt.show()
+
+
+# === USAGE ===
+# Replace `dataset` below with your actual dataset name (e.g. train_dataset or test_dataset)
+trace_df, final_metrics = evaluate_with_existing_alignment(
+    dataset=dataset,                     # your actual dataset object
+    model=model,
+    id_to_label=id_to_label,
+    tokenizer=tokenizer,
+    perturb_fn=None,                     # or insert perturbation later
+    n_samples=100
+)
+
+# === Print metrics ===
+print("\n=== Metrics ===")
+for k, v in final_metrics.items():
+    print(f"{k:<10}: {v:.4f}")
+
+# === Plot metrics ===
+plot_metrics(final_metrics)
+
+# === Display first example trace ===
+df0 = pd.DataFrame({
+    "Token": trace_df.iloc[0]["Tokens"],
+    "True Label": trace_df.iloc[0]["True Labels"],
+    "Predicted": trace_df.iloc[0]["Pred Labels"]
+})
+display(df0)

@@ -74,10 +74,17 @@ def trace_prediction_examples(dataset, model, tokenizer, id_to_label, label_to_i
 
         encoding, aligned, perturbed_tokens = advanced_perturb_tokens(words, labels_str, tokenizer, label_to_id, strategy, target)
         word_ids = tokenizer(perturbed_tokens, is_split_into_words=True).word_ids()
+
+        # Safely decode tokens from input_ids if available
+        try:
+            decoded_tokens = tokenizer.convert_ids_to_tokens(encoding["input_ids"][0])
+        except:
+            decoded_tokens = perturbed_tokens
+
         print(f"\n=== Sample {i} ===")
         print("Words:", words)
         print("Original Labels:", labels_str)
-        print("Tokens:", [tokenizer.convert_ids_to_tokens(tokenizer(perturbed_tokens, is_split_into_words=True)["input_ids"][0])[i] for i in range(len(word_ids))])
+        print("Tokens:", decoded_tokens)
         print("Word IDs:", word_ids)
 
         input_tensor = {k: v.to(model.device) for k, v in encoding.items()}
@@ -86,7 +93,7 @@ def trace_prediction_examples(dataset, model, tokenizer, id_to_label, label_to_i
             predictions = torch.argmax(logits, dim=-1).cpu().tolist()
 
         result_rows = []
-        for idx, (tok, true_id, pred_id) in enumerate(zip(perturbed_tokens, aligned, predictions)):
+        for idx, (tok, true_id, pred_id) in enumerate(zip(decoded_tokens, aligned, predictions)):
             if true_id != -100:
                 result_rows.append({
                     "Idx": idx,
@@ -95,5 +102,3 @@ def trace_prediction_examples(dataset, model, tokenizer, id_to_label, label_to_i
                     "Pred Label": id_to_label.get(pred_id, "?")
                 })
         display(pd.DataFrame(result_rows))
-
-# Note: other functions (evaluate_advanced, run_advanced_robustness, etc.) remain unchanged for now.

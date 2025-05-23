@@ -93,11 +93,13 @@ def trace_prediction_examples(dataset, model, tokenizer, id_to_label, label_to_i
         for idx, (tok, true_id, pred_id) in enumerate(zip(decoded_tokens, aligned, predictions)):
             if tok in ["[CLS]", "[SEP]", "[PAD]"] or true_id == -100:
                 continue
+            true_label = id_to_label.get(int(true_id), "?")
+            pred_label = id_to_label.get(int(pred_id), "?")
             result_rows.append({
                 "Idx": idx,
                 "Token": tok,
-                "True Label": id_to_label.get(true_id, "?"),
-                "Pred Label": id_to_label.get(pred_id, "?")
+                "True Label": true_label,
+                "Pred Label": pred_label
             })
 
         print(f"\n=== Sample {i} (strategy: {strategy}) ===")

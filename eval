@@ -22,55 +22,9 @@ def apply_perturbation_strategy(word, strategy):
     else:
         return word
 
-# --- Advanced Perturbation + Token-level Label Alignment ---
-def perturb_and_tokenize(words, labels, tokenizer, label_to_id, strategy="misspell", target="all"):
-    perturbed_words = []
-    perturbed_labels = []
-
-    for word, label in zip(words, labels):
-        should_perturb = (
-            target == "all" or
-            (target == "ticker" and "TICKER" in label) or
-            (target == "number" and is_number(word))
-        )
-
-        new_word = apply_perturbation_strategy(word, strategy) if should_perturb else word
-        tokens = tokenizer.tokenize(new_word)
-
-        if not tokens:
-            continue  # skip empty tokens
-
-        # assign correct BIO tag propagation
-        label_ids = [label_to_id[label]]
-        for _ in tokens[1:]:
-            if label.startswith("B_"):
-                label_ids.append(label_to_id.get("I_" + label[2:], label_to_id["O"]))
-            else:
-                label_ids.append(label_to_id.get(label, label_to_id["O"]))
-
-        perturbed_words.extend(tokens)
-        perturbed_labels.extend(label_ids)
-
-    encoding = tokenizer(perturbed_words, is_split_into_words=False, return_tensors="pt",
-                         padding="max_length", truncation=True, max_length=64)
-    word_ids = encoding.word_ids()
-
-    aligned_labels = []
-    token_cursor = 0
-    for word_idx in word_ids:
-        if word_idx is None:
-            aligned_labels.append(-100)
-        else:
-            if token_cursor < len(perturbed_labels):
-                aligned_labels.append(perturbed_labels[token_cursor])
-                token_cursor += 1
-            else:
-                aligned_labels.append(label_to_id["O"])
-
-    return encoding, aligned_labels, perturbed_words
-
-# --- Trace Predictions ---
-def trace_prediction_examples(dataset, model, tokenizer, id_to_label, label_to_id, strategy="none", target="all", n=3):
+# --- Perturb + Re-encode and Trace ---
+def trace_prediction_examples(dataset, model, tokenizer, id_to_label, label_to_id,
+                              strategy="none", target="all", n=3):
     from IPython.display import display
     model.eval()
 
@@ -78,31 +32,61 @@ def trace_prediction_examples(dataset, model, tokenizer, id_to_label, label_to_i
         sample = dataset[i]
         words = sample["text"].split()
         label_ids = sample["labels"]
-        label_strs = [id_to_label.get(int(l), "O") if isinstance(l, int) and l != -100 else "O" for l in label_ids]
 
-        encoding, aligned, tokens = perturb_and_tokenize(words, label_strs, tokenizer, label_to_id, strategy, target)
-        input_tensor = {k: v.to(model.device) for k, v in encoding.items()}
+        # Map IDs to string labels, for tracing
+        label_strs = [id_to_label[l] if l != -100 else "O" for l in label_ids]
+
+        # Apply word-level perturbation
+        perturbed_words = []
+        perturbed_labels = []
+        for word, label in zip(words, label_strs):
+            apply = (target == "all" or
+                     ("TICKER" in label and target == "ticker") or
+                     (is_number(word) and target == "number"))
+            w = apply_perturbation_strategy(word, strategy) if apply else word
+            perturbed_words.append(w)
+            perturbed_labels.append(label)
+
+        # Tokenize original and perturbed words
+        def tokenize_and_align(words, labels):
+            encoding = tokenizer(words, is_split_into_words=True, return_offsets_mapping=True,
+                                 padding="max_length", truncation=True, return_tensors="pt")
+            word_ids = encoding.word_ids()
+            aligned = []
+            for wi in word_ids:
+                if wi is None:
+                    aligned.append("O")
+                else:
+                    aligned.append(labels[wi] if wi < len(labels) else "O")
+            return encoding, aligned, word_ids
+
+        enc_orig, aligned_labels, word_ids = tokenize_and_align(words, label_strs)
+        enc_pert, aligned_pert_labels, _ = tokenize_and_align(perturbed_words, perturbed_labels)
+
+        input_orig = {k: v.to(model.device) for k, v in enc_orig.items() if k != "offset_mapping"}
+        input_pert = {k: v.to(model.device) for k, v in enc_pert.items() if k != "offset_mapping"}
 
         with torch.no_grad():
-            logits = model(**input_tensor).logits.squeeze()
-            predictions = torch.argmax(logits, dim=-1).cpu().tolist()
+            pred_orig = torch.argmax(model(**input_orig).logits, dim=-1)[0].cpu().tolist()
+            pred_pert = torch.argmax(model(**input_pert).logits, dim=-1)[0].cpu().tolist()
 
-        decoded_tokens = tokenizer.convert_ids_to_tokens(encoding["input_ids"][0])
-
-        result_rows = []
-        for idx, (tok, true_id, pred_id) in enumerate(zip(decoded_tokens, aligned, predictions)):
-            if tok in ["[CLS]", "[SEP]", "[PAD]"] or true_id == -100:
+        tokens = tokenizer.convert_ids_to_tokens(enc_orig["input_ids"][0])
+        rows = []
+        for j, tok in enumerate(tokens):
+            if tok in ["[CLS]", "[SEP]", "[PAD]"]:
                 continue
-            if isinstance(true_id, list): true_id = true_id[0]
-            if isinstance(pred_id, list): pred_id = pred_id[0]
-            true_label = id_to_label.get(true_id, "?")
-            pred_label = id_to_label.get(pred_id, "?")
-            result_rows.append({
-                "Idx": idx,
+            tl = aligned_labels[j] if j < len(aligned_labels) else "O"
+            pl = id_to_label.get(pred_orig[j], "?")
+            ppl = id_to_label.get(pred_pert[j], "?")
+            rows.append({
+                "Idx": j,
                 "Token": tok,
-                "True Label": true_label,
-                "Pred Label": pred_label
+                "True Label": tl,
+                "Pred Label": pl,
+                "Pert Label": ppl
             })
 
         print(f"\n=== Sample {i} (strategy: {strategy}) ===")
-        display(pd.DataFrame(result_rows))
+        print("Original Text: ", " ".join(words))
+        print("Perturbed Text:", " ".join(perturbed_words))
+        display(pd.DataFrame(rows))

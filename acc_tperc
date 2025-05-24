@@ -3,6 +3,46 @@
 
 from tqdm import tqdm
 
+# Construct dataset_by_strategy using previously used perturbation methods
+# This assumes: dataset is the original clean dataset, and you used run_experiments()
+
+# First, reconstruct word_labels from existing dataset entries using id_to_label and tokenizer
+from tqdm import tqdm
+
+def extract_word_labels(dataset, tokenizer, id_to_label):
+    for entry in dataset:
+        text = entry['text']
+        labels = entry['labels']
+        tokenized = tokenizer(text)
+        word_ids = tokenized.word_ids()
+        max_wid = max(w for w in word_ids if w is not None)
+        word_labels = ['O'] * (max_wid + 1)
+        for lid, wid in zip(labels, word_ids):
+            if wid is None or lid == -100:
+                continue
+            label_str = id_to_label[lid]
+            if word_labels[wid] == 'O' or label_str.startswith('B_'):
+                word_labels[wid] = label_str
+        entry['word_labels'] = word_labels
+
+extract_word_labels(dataset, tokenizer, id_to_label)
+
+# Rebuild dataset_by_strategy assuming previous perturbations were applied
+# and stored in perturbation_datasets or similar structure
+# Here we simulate using the same dataset across strategies for demonstration
+strategies = ["none", "misspell_all", "insert_all", "misspell_ticker", "insert_number"]
+
+dataset_by_strategy = {}
+for strategy in strategies:
+    dataset_by_strategy[strategy] = []
+    for entry in dataset:
+        dataset_by_strategy[strategy].append({
+            'text': entry['text'],
+            'word_labels': entry['word_labels']
+        })
+
+
+
 predictions_all_levels = {}
 labels_all_levels = {}
 word_ids_all_levels = {}

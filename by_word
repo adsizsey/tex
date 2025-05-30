@@ -1,0 +1,100 @@
+from sklearn.metrics import precision_score, recall_score, f1_score, accuracy_score
+from tqdm import tqdm
+import torch
+
+def extract_word_labels(entry, tokenizer, id_to_label):
+    text = entry["text"]
+    labels = entry["labels"]
+    encoding = tokenizer(text, return_offsets_mapping=True, return_attention_mask=False, truncation=True)
+    word_ids = encoding.word_ids()
+    word_labels = []
+    current_word = None
+    current_labels = []
+    for idx, word_id in enumerate(word_ids):
+        if word_id is None or labels[idx] == -100:
+            continue
+        if word_id != current_word:
+            if current_labels:
+                word_labels.append(current_labels)
+            current_labels = [labels[idx]]
+            current_word = word_id
+        else:
+            current_labels.append(labels[idx])
+    if current_labels:
+        word_labels.append(current_labels)
+    word_level = [id_to_label[l] for lset in word_labels for l in [lset[0]] if l != -100]
+    return word_level
+
+def evaluate_word_level(dataset, tokenizer, model, id_to_label, label_to_id):
+    y_true_words = []
+    y_pred_words = []
+    for entry in tqdm(dataset, desc="Evaluating"):
+        text = entry["text"]
+        true_word_labels = extract_word_labels(entry, tokenizer, id_to_label)
+        inputs = tokenizer(text, return_tensors="pt", truncation=True)
+        with torch.no_grad():
+            logits = model(**inputs).logits
+        pred_ids = torch.argmax(logits, dim=-1)[0].tolist()
+        word_ids = tokenizer(text).word_ids()
+        current_word = None
+        current_preds = []
+        predicted_words = []
+        for idx, word_id in enumerate(word_ids):
+            if word_id is None or idx >= len(pred_ids):
+                continue
+            if word_id != current_word:
+                if current_preds:
+                    predicted_words.append(id_to_label[current_preds[0]])
+                current_preds = [pred_ids[idx]]
+                current_word = word_id
+            else:
+                current_preds.append(pred_ids[idx])
+        if current_preds:
+            predicted_words.append(id_to_label[current_preds[0]])
+        y_true_words.extend(true_word_labels)
+        y_pred_words.extend(predicted_words)
+    return {
+        "accuracy": accuracy_score(y_true_words, y_pred_words),
+        "precision": precision_score(y_true_words, y_pred_words, average="weighted", zero_division=0),
+        "recall": recall_score(y_true_words, y_pred_words, average="weighted", zero_division=0),
+        "f1": f1_score(y_true_words, y_pred_words, average="weighted", zero_division=0)
+    }
+
+## part 2
+import matplotlib.pyplot as plt
+import pandas as pd
+
+# STEP 1: Define all strategy names
+strategies = [
+    "None", "Misspell_all", "Misspell_ticker", "Misspell_number",
+    "Insert_all", "Insert_ticker", "Insert_number",
+    "Combined_all", "Combined_ticker", "Combined_number"
+]
+
+# STEP 2: Build dataset_by_strategy from previous variables
+# This assumes you have variables like dataset_None, dataset_Misspell_all, etc.
+dataset_by_strategy = {
+    s: globals()[f"dataset_{s}"] for s in strategies
+}
+
+# STEP 3: Evaluate word-level metrics across strategies
+results = {}
+for strategy in strategies:
+    print(f"\nEvaluating strategy: {strategy}")
+    ds = dataset_by_strategy[strategy]
+    metrics = evaluate_word_level(ds, tokenizer, model, id_to_label, label_to_id)
+    results[strategy] = metrics
+
+# STEP 4: Convert to DataFrame for plotting
+df = pd.DataFrame(results).T.reset_index().rename(columns={"index": "Strategy"})
+
+# STEP 5: Plot grouped bar chart
+df_melt = df.melt(id_vars="Strategy", var_name="Metric", value_name="Score")
+plt.figure(figsize=(14, 6))
+ax = sns.barplot(data=df_melt, x="Strategy", y="Score", hue="Metric")
+plt.title("Word-level Performance across Perturbation Strategies")
+plt.xticks(rotation=45, ha='right')
+plt.ylim(0, 1)
+plt.tight_layout()
+plt.legend(bbox_to_anchor=(1.01, 1), loc='upper left')
+plt.show()

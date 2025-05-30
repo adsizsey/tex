@@ -1,0 +1,99 @@
+# Strategy parsing
+def parse_strategy(strategy_name):
+    if strategy_name == "None":
+        return "none", "all"
+    parts = strategy_name.split("_")
+    return parts[0].lower(), parts[1].lower()
+
+# word_labels reconstruction
+def add_word_labels_to_dataset(ds, tokenizer, id_to_label):
+    for row in ds:
+        text = row["text"]
+        label_ids = row["labels"]
+        word_ids = tokenizer(text).word_ids()
+        max_word_id = max(w for w in word_ids if w is not None)
+        word_labels = ["O"] * (max_word_id + 1)
+        for lid, wid in zip(label_ids, word_ids):
+            if wid is not None and lid != -100:
+                label_str = id_to_label[lid]
+                if word_labels[wid] == "O" or label_str.startswith("B_"):
+                    word_labels[wid] = label_str
+        row["word_labels"] = word_labels
+
+# Build all variants
+strategies = [
+    "None", "Misspell_all", "Misspell_ticker", "Misspell_number",
+    "Insert_all", "Insert_ticker", "Insert_number",
+    "Combined_all", "Combined_ticker", "Combined_number"
+]
+
+dataset_by_strategy = {}
+for strat in strategies:
+    noise_type, target_type = parse_strategy(strat)
+    perturbed = []
+    for row in dataset:
+        text = row["text"]
+        labels = row["labels"]
+        pert_text = text if noise_type == "none" else perturb_text(text, noise_type, target_type)
+        perturbed.append({"text": pert_text, "labels": labels})
+    add_word_labels_to_dataset(perturbed, tokenizer, id_to_label)
+    dataset_by_strategy[strat] = perturbed
+
+### part 2
+from tqdm import tqdm
+import pandas as pd
+import seaborn as sns
+import matplotlib.pyplot as plt
+
+# Word-level strict metric computation
+def compute_word_metrics(dataset, tokenizer, model, id_to_label, label_to_id):
+    true_labels_all = []
+    pred_labels_all = []
+
+    for row in tqdm(dataset):
+        text = row["text"]
+        word_labels = row["word_labels"]
+        encoding = tokenizer(text, return_offsets_mapping=True, return_tensors="pt", truncation=True)
+        word_ids = tokenizer(text).word_ids()
+        with torch.no_grad():
+            logits = model(**encoding.to(model.device)).logits
+        preds = torch.argmax(logits, dim=-1)[0].cpu().tolist()
+
+        for pid, wid in zip(preds, word_ids):
+            if wid is None:
+                continue
+            pred_label = id_to_label.get(pid, "O")
+            true_label = word_labels[wid] if wid < len(word_labels) else "O"
+            true_labels_all.append(true_label)
+            pred_labels_all.append(pred_label)
+
+    # Metrics
+    correct = sum(t == p for t, p in zip(true_labels_all, pred_labels_all))
+    total = len(true_labels_all)
+    labels = [t for t in true_labels_all if t != "O"]
+    predicted = [p for p in pred_labels_all if p != "O"]
+    matched = sum((t == p and t != "O") for t, p in zip(true_labels_all, pred_labels_all))
+
+    acc = correct / total if total else 0
+    precision = matched / len(predicted) if predicted else 0
+    recall = matched / len(labels) if labels else 0
+    f1 = 2 * precision * recall / (precision + recall) if precision + recall else 0
+    return {"accuracy": acc, "precision": precision, "recall": recall, "f1": f1}
+
+# Evaluate all strategies
+metrics_by_strategy = {
+    strat: compute_word_metrics(ds, tokenizer, model, id_to_label, label_to_id)
+    for strat, ds in dataset_by_strategy.items()
+}
+
+# Convert and plot
+df = pd.DataFrame(metrics_by_strategy).T.reset_index().rename(columns={"index": "Strategy"})
+df_melt = df.melt(id_vars="Strategy", var_name="Metric", value_name="Score")
+
+plt.figure(figsize=(16, 6))
+sns.barplot(data=df_melt, x="Strategy", y="Score", hue="Metric")
+plt.title("Strict Word-Level Performance across Perturbation Strategies")
+plt.xticks(rotation=45, ha='right')
+plt.ylim(0, 1)
+plt.tight_layout()
+plt.show()

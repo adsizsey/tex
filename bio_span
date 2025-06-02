@@ -1,0 +1,11 @@
+def check_bio_span_integrity(dataset, id_to_label):
+    broken_spans = []
+    for i, entry in enumerate(dataset):
+        prev = 'O'
+        for lid in entry["labels"]:
+            label = id_to_label.get(lid, 'O')
+            if label.startswith("I_") and not prev.endswith(label[2:]):
+                broken_spans.append(i)
+                break
+            prev = label
+    return broken_spans

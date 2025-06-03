@@ -1,11 +1,15 @@
-def check_bio_span_integrity(dataset, id_to_label):
-    broken_spans = []
-    for i, entry in enumerate(dataset):
-        prev = 'O'
-        for lid in entry["labels"]:
-            label = id_to_label.get(lid, 'O')
-            if label.startswith("I_") and not prev.endswith(label[2:]):
-                broken_spans.append(i)
-                break
-            prev = label
-    return broken_spans
+def relaxed_span_integrity(labels):
+    """
+    Checks B-I label integrity allowing 'O' in between but requiring matching entity types.
+    Returns True if valid, False if there's a mismatch.
+    """
+    last_entity = None
+    for label in labels:
+        if label.startswith('B_'):
+            last_entity = label[2:]
+        elif label.startswith('I_'):
+            if last_entity is None or label[2:] != last_entity:
+                return False  # mismatch or no valid preceding B tag
+        elif label == 'O':
+            continue  # allow O in between
+    return True

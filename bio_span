@@ -1,15 +1,28 @@
-def relaxed_span_integrity(labels):
+def relaxed_span_integrity_check(dataset, id_to_label):
     """
-    Checks B-I label integrity allowing 'O' in between but requiring matching entity types.
-    Returns True if valid, False if there's a mismatch.
+    Checks each sample in the dataset for relaxed BIO tagging consistency.
+    Allows 'O' between B_XXX and I_XXX as long as all I_XXX match the latest B_XXX.
+    Returns a set of indices of invalid samples.
     """
-    last_entity = None
-    for label in labels:
-        if label.startswith('B_'):
-            last_entity = label[2:]
-        elif label.startswith('I_'):
-            if last_entity is None or label[2:] != last_entity:
-                return False  # mismatch or no valid preceding B tag
-        elif label == 'O':
-            continue  # allow O in between
-    return True
+    bad_indices = set()
+
+    for i, sample in enumerate(dataset):
+        label_ids = sample['labels']
+        label_tags = [id_to_label[lid] for lid in label_ids]
+
+        last_entity = None
+        for tag in label_tags:
+            if tag.startswith('B_'):
+                last_entity = tag[2:]
+            elif tag.startswith('I_'):
+                if last_entity is None or tag[2:] != last_entity:
+                    bad_indices.add(i)
+                    break  # no need to check further
+            elif tag == 'O':
+                continue  # allowed between B and I
+            else:
+                # Unexpected format
+                bad_indices.add(i)
+                break
+
+    return bad_indices

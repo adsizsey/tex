@@ -1,0 +1,90 @@
+# Replace these with your actual dataset and label map
+test_dataset = test_dataset  # already available in your notebook
+id_to_label = id_to_label    # already available in your notebook
+
+# Run complexity analysis with plots
+import matplotlib.pyplot as plt
+import numpy as np
+from collections import Counter
+from math import log2
+from tqdm import tqdm
+
+def compute_shannon_entropy(labels):
+    total = len(labels)
+    counts = Counter(labels)
+    probs = [c / total for c in counts.values()]
+    return -sum(p * log2(p) for p in probs if p > 0)
+
+def compute_label_diversity(labels):
+    unique = len(set(labels))
+    total = len(labels)
+    return unique / total if total > 0 else 0
+
+def count_label_switches(labels):
+    return sum(1 for i in range(1, len(labels)) if labels[i] != labels[i-1])
+
+def count_BI_span_lengths(labels):
+    span_lengths = []
+    span_len = 0
+    prev_prefix = None
+    for label in labels:
+        if label == 'O' or label == -100:
+            if prev_prefix in ['B', 'I'] and span_len > 0:
+                span_lengths.append(span_len)
+            span_len = 0
+            prev_prefix = None
+        else:
+            prefix = label.split('_')[0]
+            if prefix == 'B':
+                if span_len > 0:
+                    span_lengths.append(span_len)
+                span_len = 1
+            elif prefix == 'I':
+                if prev_prefix in ['B', 'I']:
+                    span_len += 1
+                else:
+                    span_len = 1
+            prev_prefix = prefix
+    if span_len > 0:
+        span_lengths.append(span_len)
+    return span_lengths
+
+shannon_scores = []
+diversity_scores = []
+switch_counts = []
+span_length_distribution = []
+
+for item in tqdm(test_dataset, desc="Processing Samples"):
+    labels = item['labels']
+    label_names = [id_to_label[l] for l in labels if l != -100]
+    if not label_names:
+        continue
+    shannon_scores.append(compute_shannon_entropy(label_names))
+    diversity_scores.append(compute_label_diversity(label_names))
+    switch_counts.append(count_label_switches(label_names))
+    span_length_distribution.extend(count_BI_span_lengths(label_names))
+
+fig, axs = plt.subplots(2, 2, figsize=(14, 10))
+
+axs[0, 0].hist(shannon_scores, bins=30, color='blue', alpha=0.7)
+axs[0, 0].set_title("Shannon Entropy of Label Sequences")
+axs[0, 0].set_xlabel("Entropy")
+axs[0, 0].set_ylabel("Frequency")
+
+axs[0, 1].hist(diversity_scores, bins=30, color='green', alpha=0.7)
+axs[0, 1].set_title("Label Diversity per Sample")
+axs[0, 1].set_xlabel("Diversity Score")
+axs[0, 1].set_ylabel("Frequency")
+
+axs[1, 0].hist(switch_counts, bins=30, color='purple', alpha=0.7)
+axs[1, 0].set_title("Label Switch Counts per Sample")
+axs[1, 0].set_xlabel("# Switches")
+axs[1, 0].set_ylabel("Frequency")
+
+axs[1, 1].hist(span_length_distribution, bins=range(1, max(span_length_distribution)+2), color='orange', alpha=0.7, align='left')
+axs[1, 1].set_title("Span Length Distribution (B/I Labels)")
+axs[1, 1].set_xlabel("Span Length")
+axs[1, 1].set_ylabel("Frequency")
+
+plt.tight_layout()
+plt.show()

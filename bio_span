@@ -1,42 +1,39 @@
 def find_span_violations_with_indices(dataset, id_to_label):
-    violations = []  # List of dicts: {"index": i, "problem_tokens": [idx1, idx2, ...]}
-    
+    violations = []
+
     for i, example in enumerate(dataset):
         labels = example["labels"]
         label_strs = [id_to_label[l] if l != -100 else 'IGN' for l in labels]
 
-        prev_type = None
         inside_span = False
         current_span_type = None
         issue_indices = []
 
         for idx, tag in enumerate(label_strs):
-            if tag == 'IGN' or tag == 'O':
-                if inside_span:
-                    # O inside a span is now allowed, so continue
-                    continue
-                prev_type = None
+            if tag == 'IGN':
                 continue
-            
-            prefix, ent_type = tag.split('_', 1)
+            elif tag == 'O':
+                continue
+
+            parts = tag.split('_', 1)
+            if len(parts) != 2:
+                issue_indices.append(idx)
+                continue
+
+            prefix, ent_type = parts
 
             if prefix == 'B':
+                # New span starts, reset the span type
                 inside_span = True
                 current_span_type = ent_type
-                prev_type = ent_type
             elif prefix == 'I':
                 if not inside_span or ent_type != current_span_type:
                     issue_indices.append(idx)
-                prev_type = ent_type
+                # Continue span
             else:
-                # unknown prefix
                 issue_indices.append(idx)
 
         if issue_indices:
             violations.append({"index": i, "problem_tokens": issue_indices})
-    
-    return violations
 
-violations = find_span_violations_with_indices(test_dataset, id_to_label)
-print(f"{len(violations)} samples have span inconsistencies.")
-print(violations[:3])
+    return violations

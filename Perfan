@@ -1,0 +1,110 @@
+import torch
+import numpy as np
+import matplotlib.pyplot as plt
+from sklearn.metrics import classification_report, confusion_matrix, precision_recall_fscore_support
+from scipy.stats import entropy
+import seaborn as sns
+import pandas as pd
+from collections import Counter
+
+def decode_preds_and_labels(model, tokenizer, dataset, id_to_label):
+    all_preds, all_labels, all_confidences = [], [], []
+    model.eval()
+    for i in range(len(dataset)):
+        input_ids = torch.tensor([dataset[i]['input_ids']])
+        attention_mask = torch.tensor([dataset[i]['attention_mask']])
+        label_ids = dataset[i]['labels']
+
+        with torch.no_grad():
+            outputs = model(input_ids, attention_mask=attention_mask)
+            probs = outputs.logits.softmax(dim=-1).squeeze(0)
+            pred_ids = probs.argmax(dim=-1).tolist()
+            confidences = probs.max(dim=-1).values.tolist()
+
+        # Remove [CLS] and [SEP]
+        pred_ids = pred_ids[1:-1]
+        label_ids = label_ids  # labels already omit CLS/SEP
+        confidences = confidences[1:-1]
+
+        all_preds.extend(pred_ids[:len(label_ids)])
+        all_confidences.extend(confidences[:len(label_ids)])
+        all_labels.extend(label_ids)
+    
+    preds_text = [id_to_label[p] for p in all_preds]
+    labels_text = [id_to_label[l] for l in all_labels if l != -100]
+    return preds_text, labels_text, all_confidences
+
+preds_text, labels_text, confidences = decode_preds_and_labels(model, tokenizer, test_dataset, id_to_label)
+
+# 1. Token-level metrics
+print("\n[Token-Level Metrics]")
+print(classification_report(labels_text, preds_text, digits=3))
+
+# 2. Confusion matrix
+labels_set = sorted(list(set(labels_text)))
+cm = confusion_matrix(labels_text, preds_text, labels=labels_set)
+plt.figure(figsize=(12, 10))
+sns.heatmap(cm, annot=False, fmt='d', xticklabels=labels_set, yticklabels=labels_set, cmap='Blues')
+plt.title("Token-Level Confusion Matrix")
+plt.xlabel("Predicted")
+plt.ylabel("True")
+plt.tight_layout()
+plt.show()
+
+# 3. Confidence Entropy per Label
+probs_by_label = {}
+for pred, conf in zip(preds_text, confidences):
+    probs_by_label.setdefault(pred, []).append(conf)
+entropy_by_label = {lbl: entropy([np.mean(v), 1 - np.mean(v)]) for lbl, v in probs_by_label.items()}
+plt.figure(figsize=(10, 4))
+plt.bar(entropy_by_label.keys(), entropy_by_label.values())
+plt.xticks(rotation=90)
+plt.ylabel("Confidence Entropy")
+plt.title("Entropy of Model Confidence by Predicted Label")
+plt.tight_layout()
+plt.show()
+
+# 4. Label frequency vs F1
+label_counts = Counter(labels_text)
+prec, rec, f1, _ = precision_recall_fscore_support(labels_text, preds_text, labels=labels_set, zero_division=0)
+f1_df = pd.DataFrame({
+    'Label': labels_set,
+    'F1': f1,
+    'Frequency': [label_counts[l] for l in labels_set]
+})
+plt.figure(figsize=(8, 5))
+plt.scatter(f1_df['Frequency'], f1_df['F1'])
+for i, row in f1_df.iterrows():
+    plt.text(row['Frequency'], row['F1'], row['Label'], fontsize=8)
+plt.xscale('log')
+plt.xlabel("Label Frequency")
+plt.ylabel("F1 Score")
+plt.title("Label Frequency vs F1")
+plt.grid(True)
+plt.tight_layout()
+plt.show()
+
+# 5. Sample-level Accuracy at Thresholds (e.g. ≥50% tokens correct)
+thresholds = list(range(50, 101, 10))
+correct_counts = {t: 0 for t in thresholds}
+total = len(test_dataset)
+
+for entry in test_dataset:
+    input_ids = torch.tensor([entry['input_ids']])
+    attention_mask = torch.tensor([entry['attention_mask']])
+    true_labels = [l for l in entry['labels'] if l != -100]
+    with torch.no_grad():
+        probs = model(input_ids, attention_mask=attention_mask).logits.softmax(dim=-1)
+        pred_ids = probs.argmax(dim=-1).squeeze(0)[1:-1].tolist()  # remove CLS/SEP
+    pred_trimmed = pred_ids[:len(true_labels)]
+    correct = sum(1 for p, t in zip(pred_trimmed, true_labels) if p == t)
+    for t in thresholds:
+        if correct / len(true_labels) >= t / 100:
+            correct_counts[t] += 1
+
+sample_acc = {k: v / total for k, v in correct_counts.items()}
+plt.bar([f"{k}%" for k in sample_acc], sample_acc.values())
+plt.ylabel("Sample Accuracy Ratio")
+plt.title("Sample-Level Accuracy at Different Thresholds")
+plt.tight_layout()
+plt.show()

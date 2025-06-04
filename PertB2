@@ -1,0 +1,108 @@
+import torch
+import numpy as np
+from datasets import Dataset
+from transformers import AutoTokenizer, AutoModelForTokenClassification
+from sklearn.metrics import classification_report, accuracy_score, precision_recall_fscore_support
+import matplotlib.pyplot as plt
+
+# Assume these are already defined
+model = model.to("cpu").eval()  # <- fix pointer issue
+tokenizer = tokenizer
+id_to_label = id_to_label
+label_to_id = {v: k for k, v in id_to_label.items()}
+label_names = list(label_to_id.keys())
+
+# Dataset variants must be defined
+dataset_by_strategy = {
+    "no_perturb": test_dataset,
+    "misspell_ticker": misspell_ticker_dataset,
+    "misspell_number": misspell_number_dataset,
+    "insertion": insertion_dataset
+}
+
+def decode_preds(preds):
+    return [id_to_label.get(p, "O") for p in preds]
+
+def compute_metrics(preds, labels):
+    assert len(preds) == len(labels)
+    mask = np.array(labels) != -100
+    filtered_preds = np.array(preds)[mask]
+    filtered_labels = np.array(labels)[mask]
+    y_true = decode_preds(filtered_labels)
+    y_pred = decode_preds(filtered_preds)
+    prf = precision_recall_fscore_support(y_true, y_pred, average="macro", zero_division=0)
+    acc = accuracy_score(y_true, y_pred)
+    return {"accuracy": acc, "precision": prf[0], "recall": prf[1], "f1": prf[2]}
+
+def sample_level_metrics(preds, labels, threshold=0.5):
+    results = []
+    for p, l in zip(preds, labels):
+        p_np = np.array(p)
+        l_np = np.array(l)
+        valid = l_np != -100
+        if valid.sum() == 0: continue
+        p_clean = p_np[valid]
+        l_clean = l_np[valid]
+        match_ratio = (p_clean == l_clean).sum() / len(l_clean)
+        results.append(match_ratio >= threshold)
+    return np.mean(results)
+
+summary_metrics = {}
+thresholds = [0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
+sample_metrics = {t: [] for t in thresholds}
+
+for strategy, dataset in dataset_by_strategy.items():
+    all_preds = []
+    all_labels = []
+    for entry in dataset:
+        inputs = {
+            k: torch.tensor([entry[k]]) for k in ["input_ids", "attention_mask"]
+        }
+        with torch.no_grad():
+            logits = model(**inputs).logits
+        pred_ids = logits.argmax(dim=-1).squeeze().tolist()
+        label_ids = entry["labels"]
+
+        # Fix CLS/SEP handling
+        if len(pred_ids) > len(label_ids):
+            pred_ids = pred_ids[1:-1]
+
+        all_preds.extend(pred_ids)
+        all_labels.extend(label_ids)
+
+    token_metrics = compute_metrics(all_preds, all_labels)
+    summary_metrics[strategy] = token_metrics
+
+    # Sample-level metrics
+    preds_split = []
+    labels_split = []
+    i = 0
+    for entry in dataset:
+        true_labels = entry["labels"]
+        n = len(true_labels)
+        pred_labels = all_preds[i:i+n]
+        preds_split.append(pred_labels)
+        labels_split.append(true_labels)
+        i += n
+    for t in thresholds:
+        acc = sample_level_metrics(preds_split, labels_split, threshold=t)
+        sample_metrics[t].append(acc)
+
+# Plotting token-level metrics
+fig, ax = plt.subplots(figsize=(10, 5))
+for metric in ["accuracy", "precision", "recall", "f1"]:
+    ax.plot(summary_metrics.keys(), [summary_metrics[k][metric] for k in summary_metrics], label=metric)
+ax.set_title("Token-level Metrics by Perturbation Strategy")
+ax.legend()
+plt.xticks(rotation=45)
+plt.tight_layout()
+plt.show()
+
+# Plotting sample-level metrics by threshold
+for t in thresholds:
+    plt.plot(dataset_by_strategy.keys(), sample_metrics[t], label=f">={int(t*100)}%")
+plt.title("Sample-Level Accuracy vs Threshold")
+plt.legend()
+plt.xticks(rotation=45)
+plt.tight_layout()
+plt.show()

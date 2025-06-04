@@ -1,124 +1,93 @@
-import torch
-from transformers import AutoTokenizer, AutoModelForTokenClassification
-from datasets import Dataset
-from sklearn.metrics import precision_score, recall_score, f1_score, accuracy_score
-import matplotlib.pyplot as plt
 import numpy as np
+from sklearn.metrics import precision_recall_fscore_support, accuracy_score
+from transformers import AutoTokenizer
+from datasets import Dataset
+import matplotlib.pyplot as plt
+import torch
+import re
+import random
 
-# Setup: assume these are preloaded
-# tokenizer, model, id_to_label, label_to_id, test_dataset
+# Assumed to be already defined and available:
+# - model (loaded and on correct device)
+# - tokenizer (original one used for training)
+# - test_dataset (with keys: input_ids, attention_mask, labels, text)
+# - id_to_label, label_to_id
 
-# Perturbation functions
-def perturb_misspell_tickers(text):
-    return text.replace("TICK", "TIK")
-
-def perturb_misspell_numbers(text):
-    return ''.join([c if not c.isdigit() else str((int(c)+1)%10) for c in text])
-
-def perturb_insert_between(text):
-    words = text.split()
-    return ' INSERTED '.join(words)
-
-# Apply perturbation to dataset
-def apply_perturbation(dataset, strategy):
-    perturbed = []
-    for ex in dataset:
-        text = ex['text']
-        if strategy == 'misspell_ticker':
-            new_text = perturb_misspell_tickers(text)
-        elif strategy == 'misspell_number':
-            new_text = perturb_misspell_numbers(text)
-        elif strategy == 'insertion':
-            new_text = perturb_insert_between(text)
-        else:
-            new_text = text
-        new_labels = ex['labels'] + [label_to_id['O']] * (len(new_text.split()) - len(ex['labels']))
-        perturbed.append({'text': new_text, 'labels': new_labels[:len(new_text.split())]})
-    return Dataset.from_list(perturbed)
-
-# Prediction pipeline
-def predict_labels(dataset, tokenizer, model):
+def safe_model_predictions(dataset):
+    model.eval()
     preds_all, labels_all = [], []
-    for example in dataset:
-        enc = tokenizer(example['text'], return_tensors='pt', truncation=True, padding=True)
+    for entry in dataset:
         with torch.no_grad():
-            logits = model(**enc).logits
-        preds = torch.argmax(logits, dim=-1).squeeze().tolist()[1:-1]  # remove [CLS], [SEP]
-        true = [label for label in example['labels'] if label != -100]
-        preds_all.append(preds[:len(true)])
-        labels_all.append(true)
+            input_ids = torch.tensor([entry['input_ids']], dtype=torch.long)
+            attn_mask = torch.tensor([entry['attention_mask']], dtype=torch.long)
+            logits = model(input_ids=input_ids, attention_mask=attn_mask).logits
+            preds = torch.argmax(logits, dim=-1).squeeze().tolist()
+        true_labels = entry["labels"]
+        # Remove [CLS] and [SEP]
+        preds = preds[1:-1]
+        true_labels = true_labels[1:-1]
+        min_len = min(len(preds), len(true_labels))
+        preds_all.extend(preds[:min_len])
+        labels_all.extend(true_labels[:min_len])
     return preds_all, labels_all
 
-# Metric functions
-def compute_token_metrics(preds, trues):
-    pred_flat = [p for seq in preds for p in seq]
-    true_flat = [t for seq in trues for t in seq]
-    return {
-        'accuracy': accuracy_score(true_flat, pred_flat),
-        'precision': precision_score(true_flat, pred_flat, average='macro', zero_division=0),
-        'recall': recall_score(true_flat, pred_flat, average='macro', zero_division=0),
-        'f1': f1_score(true_flat, pred_flat, average='macro', zero_division=0)
-    }
+def compute_metrics(preds, labels):
+    p, r, f1, _ = precision_recall_fscore_support(labels, preds, average="macro", zero_division=0)
+    acc = accuracy_score(labels, preds)
+    return {"accuracy": acc, "precision": p, "recall": r, "f1": f1}
 
-def compute_sample_level_metrics(preds, trues, thresholds=[0.5, 0.6, 0.7, 0.8, 0.9, 1.0]):
-    results = {t: 0 for t in thresholds}
-    for p, t in zip(preds, trues):
-        if not t: continue
-        correct = sum([1 for a, b in zip(p, t) if a == b])
-        ratio = correct / len(t)
-        for th in thresholds:
-            if ratio >= th:
-                results[th] += 1
-    total = len(trues)
-    return {f'@{int(th*100)}%': count / total for th, count in results.items()}
+def misspell_numbers(text):
+    return re.sub(r'\d+', lambda m: m.group(0) + random.choice("abc"), text)
 
-# Run full analysis
-strategies = ['none', 'misspell_ticker', 'misspell_number', 'insertion']
-all_results = {}
+def misspell_tickers(text):
+    return re.sub(r'\b[A-Z]{2,5}\b', lambda m: m.group(0) + random.choice("xyz"), text)
 
-for strategy in strategies:
-    if strategy == 'none':
-        perturbed_ds = test_dataset
-    else:
-        perturbed_ds = apply_perturbation(test_dataset, strategy)
-    
-    pred_labels, true_labels = predict_labels(perturbed_ds, tokenizer, model)
-    token_metrics = compute_token_metrics(pred_labels, true_labels)
-    sample_metrics = compute_sample_level_metrics(pred_labels, true_labels)
+def insert_words(text):
+    words = text.split()
+    insert_idx = random.randint(0, len(words))
+    insert_word = random.choice(["dummy", "hello", "test"])
+    return " ".join(words[:insert_idx] + [insert_word] + words[insert_idx:])
 
-    all_results[strategy] = {
-        'token': token_metrics,
-        'sample': sample_metrics
-    }
+def prepare_dataset(texts):
+    out = []
+    for txt in texts:
+        tok = tokenizer(txt, truncation=True, padding="max_length", max_length=512)
+        labels = [label_to_id["O"]] * len(tok["input_ids"])
+        out.append({
+            "text": txt,
+            "input_ids": tok["input_ids"],
+            "attention_mask": tok["attention_mask"],
+            "labels": labels
+        })
+    return Dataset.from_list(out)
 
-# Plotting
-def plot_metrics(all_results, level='token', metric='f1'):
-    keys = list(all_results.keys())
-    values = [all_results[k][level][metric] for k in keys]
-    plt.figure(figsize=(10, 5))
-    plt.bar(keys, values)
-    plt.title(f'{metric.upper()} by Perturbation ({level}-level)')
-    plt.ylabel(metric.upper())
-    plt.xlabel('Perturbation Type')
-    plt.ylim(0, 1.05)
-    plt.grid(True)
-    plt.show()
+# Build perturbed datasets
+texts = [x['text'] for x in test_dataset]
+perturbations = {
+    "Original": texts,
+    "MisspellTickers": [misspell_tickers(t) for t in texts],
+    "MisspellNumbers": [misspell_numbers(t) for t in texts],
+    "InsertWords": [insert_words(t) for t in texts],
+}
 
-plot_metrics(all_results, level='token', metric='f1')
+results = {}
+for name, pert_texts in perturbations.items():
+    pert_dataset = prepare_dataset(pert_texts)
+    preds, labels = safe_model_predictions(pert_dataset)
+    results[name] = compute_metrics(preds, labels)
 
-# Sample-level multi-threshold plots
-def plot_sample_level_thresholds(all_results):
-    thresholds = list(next(iter(all_results.values()))['sample'].keys())
-    strategies = list(all_results.keys())
-    plt.figure(figsize=(12, 6))
-    for strat in strategies:
-        vals = [all_results[strat]['sample'][t] for t in thresholds]
-        plt.plot(thresholds, vals, label=strat)
-    plt.title('Sample Accuracy vs Threshold')
-    plt.xlabel('Threshold')
-    plt.ylabel('Accuracy')
+# Plot
+metric_names = ["accuracy", "precision", "recall", "f1"]
+x = np.arange(len(results))
+width = 0.2
+
+for i, metric in enumerate(metric_names):
+    plt.figure(figsize=(8, 4))
+    values = [results[k][metric] for k in results]
+    plt.bar(x + i * width, values, width=width, label=metric.capitalize())
+    plt.xticks(x + width, list(results.keys()))
+    plt.ylabel(metric.capitalize())
+    plt.title(f"{metric.capitalize()} Comparison Across Perturbations")
     plt.legend()
-    plt.grid(True)
+    plt.tight_layout()
     plt.show()
-
-plot_sample_level_thresholds(all_results)

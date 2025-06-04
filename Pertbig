@@ -1,93 +1,64 @@
-import numpy as np
-from sklearn.metrics import precision_recall_fscore_support, accuracy_score
-from transformers import AutoTokenizer
-from datasets import Dataset
-import matplotlib.pyplot as plt
 import torch
-import re
-import random
+from sklearn.metrics import classification_report
+import matplotlib.pyplot as plt
 
-# Assumed to be already defined and available:
-# - model (loaded and on correct device)
-# - tokenizer (original one used for training)
-# - test_dataset (with keys: input_ids, attention_mask, labels, text)
-# - id_to_label, label_to_id
+def run_ner_perturbation_analysis(model, dataset_by_strategy, id_to_label, tokenizer):
+    model = model.to("cpu")  # Force CPU usage
+    strategy_metrics = {}
 
-def safe_model_predictions(dataset):
-    model.eval()
-    preds_all, labels_all = [], []
-    for entry in dataset:
-        with torch.no_grad():
-            input_ids = torch.tensor([entry['input_ids']], dtype=torch.long)
-            attn_mask = torch.tensor([entry['attention_mask']], dtype=torch.long)
-            logits = model(input_ids=input_ids, attention_mask=attn_mask).logits
-            preds = torch.argmax(logits, dim=-1).squeeze().tolist()
-        true_labels = entry["labels"]
-        # Remove [CLS] and [SEP]
-        preds = preds[1:-1]
-        true_labels = true_labels[1:-1]
-        min_len = min(len(preds), len(true_labels))
-        preds_all.extend(preds[:min_len])
-        labels_all.extend(true_labels[:min_len])
-    return preds_all, labels_all
+    for strategy, dataset in dataset_by_strategy.items():
+        print(f"Running strategy: {strategy}")
+        all_preds = []
+        all_labels = []
 
-def compute_metrics(preds, labels):
-    p, r, f1, _ = precision_recall_fscore_support(labels, preds, average="macro", zero_division=0)
-    acc = accuracy_score(labels, preds)
-    return {"accuracy": acc, "precision": p, "recall": r, "f1": f1}
+        for example in dataset:
+            inputs = tokenizer(example['text'], return_tensors="pt", truncation=True)
+            inputs = {k: v.to("cpu") for k, v in inputs.items()}
 
-def misspell_numbers(text):
-    return re.sub(r'\d+', lambda m: m.group(0) + random.choice("abc"), text)
+            with torch.no_grad():
+                logits = model(**inputs).logits
 
-def misspell_tickers(text):
-    return re.sub(r'\b[A-Z]{2,5}\b', lambda m: m.group(0) + random.choice("xyz"), text)
+            pred_ids = torch.argmax(logits, dim=-1).squeeze().tolist()
+            label_ids = example['labels']
 
-def insert_words(text):
-    words = text.split()
-    insert_idx = random.randint(0, len(words))
-    insert_word = random.choice(["dummy", "hello", "test"])
-    return " ".join(words[:insert_idx] + [insert_word] + words[insert_idx:])
+            # Trim off CLS and SEP
+            pred_ids = pred_ids[1:len(label_ids)+1]
 
-def prepare_dataset(texts):
-    out = []
-    for txt in texts:
-        tok = tokenizer(txt, truncation=True, padding="max_length", max_length=512)
-        labels = [label_to_id["O"]] * len(tok["input_ids"])
-        out.append({
-            "text": txt,
-            "input_ids": tok["input_ids"],
-            "attention_mask": tok["attention_mask"],
-            "labels": labels
-        })
-    return Dataset.from_list(out)
+            all_preds.extend(pred_ids)
+            all_labels.extend(label_ids)
 
-# Build perturbed datasets
-texts = [x['text'] for x in test_dataset]
-perturbations = {
-    "Original": texts,
-    "MisspellTickers": [misspell_tickers(t) for t in texts],
-    "MisspellNumbers": [misspell_numbers(t) for t in texts],
-    "InsertWords": [insert_words(t) for t in texts],
-}
+        pred_tags = [id_to_label[i] for i in all_preds]
+        true_tags = [id_to_label[i] for i in all_labels]
 
-results = {}
-for name, pert_texts in perturbations.items():
-    pert_dataset = prepare_dataset(pert_texts)
-    preds, labels = safe_model_predictions(pert_dataset)
-    results[name] = compute_metrics(preds, labels)
+        report = classification_report(true_tags, pred_tags, output_dict=True, zero_division=0)
+        strategy_metrics[strategy] = {
+            "precision": report["weighted avg"]["precision"],
+            "recall": report["weighted avg"]["recall"],
+            "f1": report["weighted avg"]["f1-score"],
+            "accuracy": sum([p == t for p, t in zip(pred_tags, true_tags)]) / len(true_tags)
+        }
 
-# Plot
-metric_names = ["accuracy", "precision", "recall", "f1"]
-x = np.arange(len(results))
-width = 0.2
+    return strategy_metrics
 
-for i, metric in enumerate(metric_names):
-    plt.figure(figsize=(8, 4))
-    values = [results[k][metric] for k in results]
-    plt.bar(x + i * width, values, width=width, label=metric.capitalize())
-    plt.xticks(x + width, list(results.keys()))
-    plt.ylabel(metric.capitalize())
-    plt.title(f"{metric.capitalize()} Comparison Across Perturbations")
+def plot_strategy_metrics(strategy_metrics):
+    strategies = list(strategy_metrics.keys())
+    precision = [strategy_metrics[s]["precision"] for s in strategies]
+    recall = [strategy_metrics[s]["recall"] for s in strategies]
+    f1 = [strategy_metrics[s]["f1"] for s in strategies]
+    acc = [strategy_metrics[s]["accuracy"] for s in strategies]
+
+    x = range(len(strategies))
+    plt.figure(figsize=(12, 6))
+    plt.bar(x, precision, width=0.2, label="Precision")
+    plt.bar([i + 0.2 for i in x], recall, width=0.2, label="Recall")
+    plt.bar([i + 0.4 for i in x], f1, width=0.2, label="F1")
+    plt.bar([i + 0.6 for i in x], acc, width=0.2, label="Accuracy")
+    plt.xticks([i + 0.3 for i in x], strategies, rotation=45)
     plt.legend()
+    plt.title("Token-level NER Performance under Perturbations")
     plt.tight_layout()
     plt.show()
+
+# Usage:
+# strategy_metrics = run_ner_perturbation_analysis(model, dataset_by_strategy, id_to_label, tokenizer)
+# plot_strategy_metrics(strategy_metrics)

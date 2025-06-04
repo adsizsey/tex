@@ -1,64 +1,151 @@
-import torch
-from sklearn.metrics import classification_report
+import re
+import numpy as np
 import matplotlib.pyplot as plt
+from datasets import Dataset
+from collections import Counter, defaultdict
+from tqdm import tqdm
+import torch
 
-def run_ner_perturbation_analysis(model, dataset_by_strategy, id_to_label, tokenizer):
-    model = model.to("cpu")  # Force CPU usage
-    strategy_metrics = {}
+# Assumed to be available
+# test_dataset, tokenizer, model, id_to_label, label_to_id
 
-    for strategy, dataset in dataset_by_strategy.items():
-        print(f"Running strategy: {strategy}")
-        all_preds = []
-        all_labels = []
+model.to("cpu")
+model.eval()
 
-        for example in dataset:
-            inputs = tokenizer(example['text'], return_tensors="pt", truncation=True)
-            inputs = {k: v.to("cpu") for k, v in inputs.items()}
+# Utility: decode id to label
+def decode_labels(label_ids):
+    return [id_to_label[lid] for lid in label_ids if lid != -100]
 
-            with torch.no_grad():
-                logits = model(**inputs).logits
+# Perturbation functions
+def misspell_tickers(text):
+    return re.sub(r'\b[A-Z]{2,5}\b', lambda m: m.group(0)[:-1] + 'x', text)
 
-            pred_ids = torch.argmax(logits, dim=-1).squeeze().tolist()
-            label_ids = example['labels']
+def misspell_numbers(text):
+    return re.sub(r'\b\d+\b', lambda m: m.group(0)[::-1], text)
 
-            # Trim off CLS and SEP
-            pred_ids = pred_ids[1:len(label_ids)+1]
+def insert_words(text):
+    words = text.split()
+    if len(words) < 3: return text
+    return ' '.join([w + " filler" if i % 4 == 2 else w for i, w in enumerate(words)])
 
-            all_preds.extend(pred_ids)
-            all_labels.extend(label_ids)
+# Apply perturbation strategies
+def apply_perturbation(dataset, strategy):
+    perturbed = []
+    for row in dataset:
+        text = row['text']
+        if strategy == "NoPerturb":
+            new_text = text
+        elif strategy == "MisspellTicker":
+            new_text = misspell_tickers(text)
+        elif strategy == "MisspellNumber":
+            new_text = misspell_numbers(text)
+        elif strategy == "InsertWord":
+            new_text = insert_words(text)
+        else:
+            raise ValueError(f"Unknown strategy: {strategy}")
+        perturbed.append({'text': new_text, 'labels': row['labels']})
+    return Dataset.from_list(perturbed)
 
-        pred_tags = [id_to_label[i] for i in all_preds]
-        true_tags = [id_to_label[i] for i in all_labels]
+strategies = ["NoPerturb", "MisspellTicker", "MisspellNumber", "InsertWord"]
+dataset_by_strategy = {s: apply_perturbation(test_dataset, s) for s in strategies}
 
-        report = classification_report(true_tags, pred_tags, output_dict=True, zero_division=0)
-        strategy_metrics[strategy] = {
-            "precision": report["weighted avg"]["precision"],
-            "recall": report["weighted avg"]["recall"],
-            "f1": report["weighted avg"]["f1-score"],
-            "accuracy": sum([p == t for p, t in zip(pred_tags, true_tags)]) / len(true_tags)
-        }
+# Align prediction with labels (remove [CLS], [SEP])
+def predict_labels(dataset):
+    all_preds, all_true, all_words, all_logits = [], [], [], []
+    for row in tqdm(dataset):
+        inputs = tokenizer(row['text'], return_tensors='pt', truncation=True, padding=True)
+        inputs = {k: v.to("cpu") for k, v in inputs.items()}
+        with torch.no_grad():
+            logits = model(**inputs).logits.squeeze(0)
+        pred_ids = torch.argmax(logits, axis=-1).numpy().tolist()[1:-1]
+        label_ids = [lid for lid in row['labels'] if lid != -100]
+        all_preds.append(pred_ids)
+        all_true.append(label_ids)
+        tokens = tokenizer.tokenize(row['text'])
+        all_words.append(tokens)
+        all_logits.append(logits[1:-1])
+    return all_preds, all_true, all_words, all_logits
 
-    return strategy_metrics
+# Convert token-level to word-level labels
+def align_word_labels(token_ids, labels):
+    word_ids = tokenizer.convert_ids_to_tokens(token_ids)
+    word_labels = []
+    current_word = ""
+    current_label = "O"
+    for tok, lab in zip(word_ids, labels):
+        if tok.startswith("##"):
+            current_word += tok[2:]
+        else:
+            if current_word:
+                word_labels.append(current_label)
+            current_word = tok
+            current_label = id_to_label[lab]
+    if current_word:
+        word_labels.append(current_label)
+    return word_labels
 
-def plot_strategy_metrics(strategy_metrics):
-    strategies = list(strategy_metrics.keys())
-    precision = [strategy_metrics[s]["precision"] for s in strategies]
-    recall = [strategy_metrics[s]["recall"] for s in strategies]
-    f1 = [strategy_metrics[s]["f1"] for s in strategies]
-    acc = [strategy_metrics[s]["accuracy"] for s in strategies]
+# Sample-level accuracy under different thresholds
+def sample_level_accuracy(preds, trues, thresholds=[0.5, 0.6, 0.7, 0.8, 0.9, 1.0]):
+    results = {t: 0 for t in thresholds}
+    for p_seq, t_seq in zip(preds, trues):
+        match = [int(p == t) for p, t in zip(p_seq, t_seq)]
+        acc = sum(match) / len(match) if match else 0
+        for t in thresholds:
+            if acc >= t:
+                results[t] += 1
+    total = len(preds)
+    return {f"sample_acc@{int(k*100)}": v / total for k, v in results.items()}
 
-    x = range(len(strategies))
-    plt.figure(figsize=(12, 6))
-    plt.bar(x, precision, width=0.2, label="Precision")
-    plt.bar([i + 0.2 for i in x], recall, width=0.2, label="Recall")
-    plt.bar([i + 0.4 for i in x], f1, width=0.2, label="F1")
-    plt.bar([i + 0.6 for i in x], acc, width=0.2, label="Accuracy")
-    plt.xticks([i + 0.3 for i in x], strategies, rotation=45)
-    plt.legend()
-    plt.title("Token-level NER Performance under Perturbations")
+# Per entity type F1
+def per_entity_f1(preds, trues):
+    counts = defaultdict(lambda: [0, 0, 0])  # TP, FP, FN
+    for p_seq, t_seq in zip(preds, trues):
+        for p, t in zip(p_seq, t_seq):
+            p_lab, t_lab = id_to_label[p], id_to_label[t]
+            if p_lab == t_lab:
+                counts[t_lab][0] += 1
+            else:
+                counts[p_lab][1] += 1
+                counts[t_lab][2] += 1
+    result = {}
+    for ent, (tp, fp, fn) in counts.items():
+        prec = tp / (tp + fp + 1e-8)
+        rec = tp / (tp + fn + 1e-8)
+        f1 = 2 * prec * rec / (prec + rec + 1e-8)
+        result[ent] = f1
+    return result
+
+# Evaluate each strategy
+all_metrics = {}
+for strat in strategies:
+    preds, trues, _, _ = predict_labels(dataset_by_strategy[strat])
+    flat_p = [p for seq in preds for p in seq]
+    flat_t = [t for seq in trues for t in seq]
+    accuracy = np.mean([int(p == t) for p, t in zip(flat_p, flat_t)])
+    precision = sum(p == t for p, t in zip(flat_p, flat_t) if p != label_to_id['O']) / (sum(p != label_to_id['O'] for p in flat_p) + 1e-8)
+    recall = sum(p == t for p, t in zip(flat_p, flat_t) if t != label_to_id['O']) / (sum(t != label_to_id['O'] for t in flat_t) + 1e-8)
+    f1 = 2 * precision * recall / (precision + recall + 1e-8)
+    sample_accs = sample_level_accuracy(preds, trues)
+    entity_f1 = per_entity_f1(preds, trues)
+    all_metrics[strat] = {
+        "accuracy": accuracy,
+        "precision": precision,
+        "recall": recall,
+        "f1": f1,
+        **sample_accs,
+        **entity_f1
+    }
+
+# Plot overall metrics
+def plot_metric(metric_name):
+    plt.figure(figsize=(10,5))
+    for strat in strategies:
+        plt.bar(strat, all_metrics[strat][metric_name])
+    plt.ylabel(metric_name)
+    plt.title(f"{metric_name} across perturbation strategies")
+    plt.xticks(rotation=15)
     plt.tight_layout()
     plt.show()
 
-# Usage:
-# strategy_metrics = run_ner_perturbation_analysis(model, dataset_by_strategy, id_to_label, tokenizer)
-# plot_strategy_metrics(strategy_metrics)
+for m in ["accuracy", "precision", "recall", "f1"]:
+    plot_metric(m)

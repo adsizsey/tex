@@ -1,110 +1,127 @@
 import torch
 import numpy as np
-import matplotlib.pyplot as plt
-from sklearn.metrics import classification_report, confusion_matrix, precision_recall_fscore_support
-from scipy.stats import entropy
-import seaborn as sns
-import pandas as pd
 from collections import Counter
+import matplotlib.pyplot as plt
+from tqdm import tqdm
+from transformers import AutoTokenizer, AutoModelForTokenClassification
 
-def decode_preds_and_labels(model, tokenizer, dataset, id_to_label):
-    all_preds, all_labels, all_confidences = [], [], []
+# Assumed available: model, tokenizer, id_to_label, dataset (with text, input_ids, attention_mask, labels)
+
+def compute_token_level_accuracy(dataset, model, device):
+    correct, total = 0, 0
     model.eval()
-    for i in range(len(dataset)):
-        input_ids = torch.tensor([dataset[i]['input_ids']])
-        attention_mask = torch.tensor([dataset[i]['attention_mask']])
-        label_ids = dataset[i]['labels']
+    for ex in tqdm(dataset):
+        input_ids = torch.tensor([ex['input_ids']]).to(device)
+        attention_mask = torch.tensor([ex['attention_mask']]).to(device)
+        labels = torch.tensor(ex['labels'])
 
         with torch.no_grad():
-            outputs = model(input_ids, attention_mask=attention_mask)
-            probs = outputs.logits.softmax(dim=-1).squeeze(0)
-            pred_ids = probs.argmax(dim=-1).tolist()
-            confidences = probs.max(dim=-1).values.tolist()
+            logits = model(input_ids=input_ids, attention_mask=attention_mask).logits
+            preds = torch.argmax(logits, dim=-1).squeeze().cpu()
 
-        # Remove [CLS] and [SEP]
-        pred_ids = pred_ids[1:-1]
-        label_ids = label_ids  # labels already omit CLS/SEP
-        confidences = confidences[1:-1]
+        for p, l, m in zip(preds, labels, ex['attention_mask']):
+            if l != -100 and m == 1:
+                total += 1
+                correct += int(p == l)
+    return correct / total if total > 0 else 0
 
-        all_preds.extend(pred_ids[:len(label_ids)])
-        all_confidences.extend(confidences[:len(label_ids)])
-        all_labels.extend(label_ids)
-    
-    preds_text = [id_to_label[p] for p in all_preds]
-    labels_text = [id_to_label[l] for l in all_labels if l != -100]
-    return preds_text, labels_text, all_confidences
+def plot_label_distribution(dataset, id_to_label):
+    counter = Counter()
+    for ex in dataset:
+        for lid in ex['labels']:
+            if lid != -100:
+                counter[id_to_label[lid]] += 1
+    labels, counts = zip(*sorted(counter.items()))
+    plt.figure()
+    plt.bar(labels, counts)
+    plt.xticks(rotation=90)
+    plt.title("Label Distribution")
+    plt.tight_layout()
+    plt.show()
 
-preds_text, labels_text, confidences = decode_preds_and_labels(model, tokenizer, test_dataset, id_to_label)
+def compute_word_level_accuracy(dataset, model, tokenizer, id_to_label, match_type="strict"):
+    correct, total = 0, 0
+    model.eval()
+    for ex in tqdm(dataset):
+        input_ids = torch.tensor([ex['input_ids']]).to(model.device)
+        attention_mask = torch.tensor([ex['attention_mask']]).to(model.device)
+        labels = ex['labels']
 
-# 1. Token-level metrics
-print("\n[Token-Level Metrics]")
-print(classification_report(labels_text, preds_text, digits=3))
+        with torch.no_grad():
+            logits = model(input_ids=input_ids, attention_mask=attention_mask).logits
+        preds = torch.argmax(logits, dim=-1).squeeze().cpu().tolist()
 
-# 2. Confusion matrix
-labels_set = sorted(list(set(labels_text)))
-cm = confusion_matrix(labels_text, preds_text, labels=labels_set)
-plt.figure(figsize=(12, 10))
-sns.heatmap(cm, annot=False, fmt='d', xticklabels=labels_set, yticklabels=labels_set, cmap='Blues')
-plt.title("Token-Level Confusion Matrix")
-plt.xlabel("Predicted")
-plt.ylabel("True")
-plt.tight_layout()
-plt.show()
+        tokens = tokenizer.convert_ids_to_tokens(ex['input_ids'])
+        word_ids = tokenizer(ex['text'], return_offsets_mapping=True).word_ids()
 
-# 3. Confidence Entropy per Label
-probs_by_label = {}
-for pred, conf in zip(preds_text, confidences):
-    probs_by_label.setdefault(pred, []).append(conf)
-entropy_by_label = {lbl: entropy([np.mean(v), 1 - np.mean(v)]) for lbl, v in probs_by_label.items()}
-plt.figure(figsize=(10, 4))
-plt.bar(entropy_by_label.keys(), entropy_by_label.values())
-plt.xticks(rotation=90)
-plt.ylabel("Confidence Entropy")
-plt.title("Entropy of Model Confidence by Predicted Label")
-plt.tight_layout()
-plt.show()
+        word_map = {}
+        for idx, wid in enumerate(word_ids):
+            if wid is not None:
+                word_map.setdefault(wid, []).append(idx)
 
-# 4. Label frequency vs F1
-label_counts = Counter(labels_text)
-prec, rec, f1, _ = precision_recall_fscore_support(labels_text, preds_text, labels=labels_set, zero_division=0)
-f1_df = pd.DataFrame({
-    'Label': labels_set,
-    'F1': f1,
-    'Frequency': [label_counts[l] for l in labels_set]
-})
-plt.figure(figsize=(8, 5))
-plt.scatter(f1_df['Frequency'], f1_df['F1'])
-for i, row in f1_df.iterrows():
-    plt.text(row['Frequency'], row['F1'], row['Label'], fontsize=8)
-plt.xscale('log')
-plt.xlabel("Label Frequency")
-plt.ylabel("F1 Score")
-plt.title("Label Frequency vs F1")
-plt.grid(True)
-plt.tight_layout()
-plt.show()
+        for wid, idxs in word_map.items():
+            pred_tags = [id_to_label.get(preds[i], 'O') for i in idxs if labels[i] != -100]
+            true_tags = [id_to_label.get(labels[i], 'O') for i in idxs if labels[i] != -100]
+            if not true_tags:
+                continue
+            total += 1
+            if match_type == "strict":
+                correct += int(pred_tags == true_tags)
+            else:  # majority
+                correct += int(Counter(pred_tags).most_common(1)[0][0] == Counter(true_tags).most_common(1)[0][0])
+    return correct / total if total > 0 else 0
 
-# 5. Sample-level Accuracy at Thresholds (e.g. ≥50% tokens correct)
-thresholds = list(range(50, 101, 10))
-correct_counts = {t: 0 for t in thresholds}
-total = len(test_dataset)
+def plot_prediction_confidence(dataset, model):
+    all_conf = []
+    model.eval()
+    for ex in tqdm(dataset):
+        input_ids = torch.tensor([ex['input_ids']]).to(model.device)
+        attention_mask = torch.tensor([ex['attention_mask']]).to(model.device)
 
-for entry in test_dataset:
-    input_ids = torch.tensor([entry['input_ids']])
-    attention_mask = torch.tensor([entry['attention_mask']])
-    true_labels = [l for l in entry['labels'] if l != -100]
-    with torch.no_grad():
-        probs = model(input_ids, attention_mask=attention_mask).logits.softmax(dim=-1)
-        pred_ids = probs.argmax(dim=-1).squeeze(0)[1:-1].tolist()  # remove CLS/SEP
-    pred_trimmed = pred_ids[:len(true_labels)]
-    correct = sum(1 for p, t in zip(pred_trimmed, true_labels) if p == t)
-    for t in thresholds:
-        if correct / len(true_labels) >= t / 100:
-            correct_counts[t] += 1
+        with torch.no_grad():
+            logits = model(input_ids=input_ids, attention_mask=attention_mask).logits
+            probs = torch.nn.functional.softmax(logits, dim=-1).squeeze()
+        for i, m in enumerate(ex['attention_mask']):
+            if m == 1 and ex['labels'][i] != -100:
+                all_conf.append(probs[i].max().item())
 
-sample_acc = {k: v / total for k, v in correct_counts.items()}
-plt.bar([f"{k}%" for k in sample_acc], sample_acc.values())
-plt.ylabel("Sample Accuracy Ratio")
-plt.title("Sample-Level Accuracy at Different Thresholds")
-plt.tight_layout()
-plt.show()
+    plt.hist(all_conf, bins=20, range=(0,1))
+    plt.title("Prediction Confidence Histogram")
+    plt.xlabel("Confidence")
+    plt.ylabel("Token Count")
+    plt.show()
+
+def sequence_level_correctness(dataset, model, id_to_label, thresholds=[0.5, 0.75, 1.0]):
+    results = {t: 0 for t in thresholds}
+    total = 0
+    model.eval()
+    for ex in tqdm(dataset):
+        input_ids = torch.tensor([ex['input_ids']]).to(model.device)
+        attention_mask = torch.tensor([ex['attention_mask']]).to(model.device)
+        labels = ex['labels']
+
+        with torch.no_grad():
+            logits = model(input_ids=input_ids, attention_mask=attention_mask).logits
+        preds = torch.argmax(logits, dim=-1).squeeze().cpu().tolist()
+
+        valid_pairs = [(p, l) for p, l, m in zip(preds, labels, ex['attention_mask']) if l != -100 and m == 1]
+        if not valid_pairs:
+            continue
+        matches = sum(1 for p, l in valid_pairs if p == l)
+        ratio = matches / len(valid_pairs)
+        total += 1
+        for t in thresholds:
+            if ratio >= t:
+                results[t] += 1
+    return {t: results[t] / total for t in thresholds}
+
+# Run everything
+device = model.device
+print("1. Token-level accuracy:", compute_token_level_accuracy(dataset, model, device))
+print("2. Word-level accuracy (strict):", compute_word_level_accuracy(dataset, model, tokenizer, id_to_label, match_type="strict"))
+print("3. Word-level accuracy (majority):", compute_word_level_accuracy(dataset, model, tokenizer, id_to_label, match_type="majority"))
+print("4. Sequence-level correctness:", sequence_level_correctness(dataset, model, id_to_label))
+print("5. Plotting label distribution:")
+plot_label_distribution(dataset, id_to_label)
+print("6. Plotting prediction confidence:")
+plot_prediction_confidence(dataset, model)

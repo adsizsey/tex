@@ -1,0 +1,62 @@
+import numpy as np
+import matplotlib.pyplot as plt
+from collections import Counter
+import torch
+from tqdm import tqdm
+
+def compute_sample_level_accuracy(dataset, tokenizer, model, id_to_label, thresholds=np.arange(0.5, 1.01, 0.1)):
+    results = {thresh: 0 for thresh in thresholds}
+    total_samples = len(dataset)
+
+    for entry in tqdm(dataset, desc="Evaluating samples"):
+        text = entry['text']
+        true_labels = entry['labels']
+
+        # Tokenize and align word ids
+        encoding = tokenizer(text, return_offsets_mapping=True, return_tensors='pt', truncation=True)
+        word_ids = encoding.word_ids()
+        with torch.no_grad():
+            outputs = model(**encoding)
+        pred_ids = outputs.logits.argmax(dim=-1)[0].tolist()
+
+        word_to_true = {}
+        word_to_pred = {}
+        for idx, word_id in enumerate(word_ids):
+            if word_id is None or idx == 0 or idx == len(word_ids) - 1:
+                continue  # skip special tokens
+            if word_id not in word_to_true:
+                word_to_true[word_id] = []
+                word_to_pred[word_id] = []
+            lid = true_labels[idx - 1]  # labels skip [CLS]
+            if lid == -100:
+                continue
+            word_to_true[word_id].append(id_to_label[lid])
+            word_to_pred[word_id].append(id_to_label[pred_ids[idx]])
+
+        correct_words = 0
+        total_words = len(word_to_true)
+        for wid in word_to_true:
+            if not word_to_pred.get(wid): continue
+            if Counter(word_to_true[wid]).most_common(1)[0][0] == Counter(word_to_pred[wid]).most_common(1)[0][0]:
+                correct_words += 1
+
+        acc_ratio = correct_words / total_words if total_words > 0 else 0
+        for thresh in thresholds:
+            if acc_ratio >= thresh:
+                results[thresh] += 1
+
+    results = {k: v / total_samples for k, v in results.items()}
+
+    # Plot
+    plt.figure(figsize=(8, 5))
+    plt.plot(list(results.keys()), list(results.values()), marker='o')
+    plt.title("Sample-Level Accuracy at Different Word Match Thresholds")
+    plt.xlabel("Minimum Fraction of Words Correct")
+    plt.ylabel("Fraction of Correct Samples")
+    plt.grid(True)
+    plt.xticks(thresholds)
+    plt.ylim(0, 1)
+    plt.tight_layout()
+    plt.show()
+
+    return results

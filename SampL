@@ -1,62 +1,52 @@
-import numpy as np
-import matplotlib.pyplot as plt
-from collections import Counter
 import torch
+import matplotlib.pyplot as plt
 from tqdm import tqdm
 
-def compute_sample_level_accuracy(dataset, tokenizer, model, id_to_label, thresholds=np.arange(0.5, 1.01, 0.1)):
-    results = {thresh: 0 for thresh in thresholds}
-    total_samples = len(dataset)
+# Assumes you already have test_dataset, model, tokenizer, id_to_label
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+model.to(device)
+model.eval()
 
-    for entry in tqdm(dataset, desc="Evaluating samples"):
-        text = entry['text']
-        true_labels = entry['labels']
+thresholds = list(range(50, 101, 10))  # 50% to 100%
+correct_ratios = {t: [] for t in thresholds}
 
-        # Tokenize and align word ids
-        encoding = tokenizer(text, return_offsets_mapping=True, return_tensors='pt', truncation=True)
-        word_ids = encoding.word_ids()
-        with torch.no_grad():
-            outputs = model(**encoding)
-        pred_ids = outputs.logits.argmax(dim=-1)[0].tolist()
+for i in tqdm(range(len(test_dataset))):
+    batch = test_dataset[i]
+    input_ids = torch.tensor(batch["input_ids"]).unsqueeze(0).to(device)
+    attention_mask = torch.tensor(batch["attention_mask"]).unsqueeze(0).to(device)
+    labels = batch["labels"]
 
-        word_to_true = {}
-        word_to_pred = {}
-        for idx, word_id in enumerate(word_ids):
-            if word_id is None or idx == 0 or idx == len(word_ids) - 1:
-                continue  # skip special tokens
-            if word_id not in word_to_true:
-                word_to_true[word_id] = []
-                word_to_pred[word_id] = []
-            lid = true_labels[idx - 1]  # labels skip [CLS]
-            if lid == -100:
-                continue
-            word_to_true[word_id].append(id_to_label[lid])
-            word_to_pred[word_id].append(id_to_label[pred_ids[idx]])
+    with torch.no_grad():
+        logits = model(input_ids=input_ids, attention_mask=attention_mask).logits
+        predictions = torch.argmax(logits, dim=-1).squeeze().tolist()
 
-        correct_words = 0
-        total_words = len(word_to_true)
-        for wid in word_to_true:
-            if not word_to_pred.get(wid): continue
-            if Counter(word_to_true[wid]).most_common(1)[0][0] == Counter(word_to_pred[wid]).most_common(1)[0][0]:
-                correct_words += 1
+    # Remove special tokens
+    pred_labels = predictions[1:-1]
+    true_labels = labels
 
-        acc_ratio = correct_words / total_words if total_words > 0 else 0
-        for thresh in thresholds:
-            if acc_ratio >= thresh:
-                results[thresh] += 1
+    # Alignment check
+    assert len(pred_labels) == len(true_labels), f"Length mismatch at idx {i}"
 
-    results = {k: v / total_samples for k, v in results.items()}
+    total_valid = sum(1 for l in true_labels if l != -100)
+    correct = sum(1 for p, l in zip(pred_labels, true_labels) if l != -100 and p == l)
 
-    # Plot
-    plt.figure(figsize=(8, 5))
-    plt.plot(list(results.keys()), list(results.values()), marker='o')
-    plt.title("Sample-Level Accuracy at Different Word Match Thresholds")
-    plt.xlabel("Minimum Fraction of Words Correct")
-    plt.ylabel("Fraction of Correct Samples")
-    plt.grid(True)
-    plt.xticks(thresholds)
-    plt.ylim(0, 1)
-    plt.tight_layout()
-    plt.show()
+    if total_valid == 0:
+        continue
 
-    return results
+    percent_correct = 100 * correct / total_valid
+    for t in thresholds:
+        correct_ratios[t].append(int(percent_correct >= t))
+
+# Compute overall accuracy at each threshold
+accuracy_by_threshold = {t: sum(correct_ratios[t]) / len(correct_ratios[t]) for t in thresholds}
+
+# Plot
+plt.figure(figsize=(10, 6))
+plt.bar([f"{t}%" for t in thresholds], list(accuracy_by_threshold.values()))
+plt.xlabel("Minimum % of Tokens Correct per Sample")
+plt.ylabel("Proportion of Samples Meeting Threshold")
+plt.title("Sample-Level Accuracy vs Thresholds")
+plt.ylim(0, 1.05)
+plt.grid(axis='y')
+plt.tight_layout()
+plt.show()

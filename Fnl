@@ -1,160 +1,138 @@
-import random
-import re
-import numpy as np
-import torch
-from datasets import Dataset
-import matplotlib.pyplot as plt
-from tqdm import tqdm
+import random, re, torch, numpy as np, matplotlib.pyplot as plt
 from copy import deepcopy
+from datasets import Dataset
+from tqdm.auto import tqdm
 
-# ========== 1. Perturbation Functions ==========
-def misspell_tickers(example):
-    words = example['text'].split()
-    new_words = deepcopy(words)
-    for idx, lid in enumerate(example['labels']):
+###############################################################################
+# 1 ─────  PERTURBATION FUNCTIONS
+###############################################################################
+def misspell_tickers(ex):
+    words = ex["text"].split()
+    for i, lid in enumerate(ex["labels"]):
         if lid == -100:
             continue
-        label = id_to_label[lid]
-        if label.endswith("Ticker") and len(words[idx]) > 2:
-            new_words[idx] = words[idx][0] + words[idx][2:]  # remove 2nd char
+        if id_to_label[lid].endswith("Ticker") and len(words[i]) > 2:
+            words[i] = words[i][0] + words[i][2:]            # drop 2nd char
             break
-    example['text'] = ' '.join(new_words)
-    return example
+    ex["text"] = " ".join(words)
+    return ex
 
-def misspell_numbers(example):
-    words = example['text'].split()
-    new_words = deepcopy(words)
-    for idx, word in enumerate(words):
-        if word.replace('.', '', 1).isdigit() and len(word) > 2:
-            new_words[idx] = word[:-1]  # remove last char
+def misspell_numbers(ex):
+    words = ex["text"].split()
+    for i, w in enumerate(words):
+        if w.replace(".", "", 1).isdigit() and len(w) > 2:
+            words[i] = w[:-1]                                # drop last digit
             break
-    example['text'] = ' '.join(new_words)
-    return example
+    ex["text"] = " ".join(words)
+    return ex
 
-def insert_words(example):
-    insertables = ["foo", "bar", "baz"]
-    words = example['text'].split()
-    new_words = []
-    for w in words:
-        new_words.append(w)
-        if random.random() < 0.2:
-            new_words.append(random.choice(insertables))
-    example['text'] = ' '.join(new_words)
-    return example
+def insert_words(ex, insertables=("foo", "bar", "baz")):
+    ws, out = ex["text"].split(), []
+    for w in ws:
+        out.append(w)
+        if random.random() < 0.20:
+            out.append(random.choice(insertables))
+    ex["text"] = " ".join(out)
+    return ex
 
-def combined_all(example):
-    return insert_words(misspell_numbers(misspell_tickers(example)))
+def combined_all(ex):
+    return insert_words(misspell_numbers(misspell_tickers(ex)))
 
-# ========== 2. Strategy Mapping ==========
-
-perturbation_strategies = {
-    "NoPerturb": lambda x: x,  # No perturbation
-    "Misspell_Ticker": misspell_tickers,
-    "Misspell_Number": misspell_numbers,
-    "Insert_Words": insert_words,
-    "Combined_All": combined_all
+###############################################################################
+# 2 ─────  STRATEGY DICTIONARY
+###############################################################################
+strategies = {
+    "NoPerturb"      : lambda x: x,
+    "MisspellTicker" : misspell_tickers,
+    "MisspellNumber" : misspell_numbers,
+    "InsertWords"    : insert_words,
+    "CombinedAll"    : combined_all,
 }
 
-# ========== 3. Dataset Creation and Perturbations ==========
+###############################################################################
+# 3 ─────  TOKENIZE + ALIGN  (-100 for specials / padding)
+###############################################################################
+def tokenize_align(text:str, word_labels:list[int]):
+    tok = tokenizer(
+        text, return_offsets_mapping=True,
+        padding="max_length", truncation=True, max_length=128
+    )
+    # map token → word-index
+    wids = tok.word_ids()
+    tlabs = []
+    for wid in wids:
+        if wid is None:
+            tlabs.append(-100)                       # CLS, SEP, PAD
+        else:
+            tlabs.append(word_labels[wid] if wid < len(word_labels) else label_to_id["O"])
+    tok.pop("offset_mapping")
+    tok["labels"] = tlabs
+    return tok
 
-def create_dataset_by_strategy(base_dataset, tokenizer, label_to_id):
-    """
-    Create new datasets for each perturbation strategy.
-    Aligns the labels and handles tokenization accordingly.
-    """
-    results = {}
-    for name, perturb_fn in perturbation_strategies.items():
-        print(f"Applying strategy: {name}")
-        ds = base_dataset.map(perturb_fn)
-        
-        # Re-tokenize and align labels
-        tokenized = tokenizer(ds['text'], truncation=True, padding='max_length', max_length=128, return_offsets_mapping=True)
-        new_labels = []
-        for i, offsets in enumerate(tokenized['offset_mapping']):
-            word_ids = tokenizer(ds['text'][i], return_offsets_mapping=True).word_ids()
-            raw_labels = ds[i]['labels']
-            aligned = []
-            for wid in word_ids:
-                if wid is None:
-                    aligned.append(-100)
-                else:
-                    aligned.append(raw_labels[wid] if wid < len(raw_labels) else -100)
-            aligned += [-100] * (128 - len(aligned))  # Padding to max length
-            new_labels.append(aligned[:128])  # Truncate to max length if necessary
-        tokenized['labels'] = new_labels
-        tokenized.pop('offset_mapping', None)
-        results[name] = Dataset.from_dict(tokenized)
-    return results
+###############################################################################
+# 4 ─────  BUILD DATASETS FOR EVERY STRATEGY
+###############################################################################
+dataset_by_strategy = {}
 
-# ========== 4. Model Evaluation ==========
+print("\n⌛  Applying perturbations & realigning …")
+for sname, fn in strategies.items():
+    pert = test_dataset.map(lambda ex: fn(deepcopy(ex)))
+    # realign labels sample-by-sample
+    toks = {k: [] for k in ["input_ids", "attention_mask", "labels", "text"]}
+    for ex in tqdm(pert, desc=f"→ {sname}"):
+        aligned = tokenize_align(ex["text"], ex["labels"])
+        toks["input_ids"].append(aligned["input_ids"])
+        toks["attention_mask"].append(aligned["attention_mask"])
+        toks["labels"].append(aligned["labels"])
+        toks["text"].append(ex["text"])
+    dataset_by_strategy[sname] = Dataset.from_dict(toks)
 
-def evaluate_model(model, dataset, id_to_label, device):
-    """
-    Evaluates the model performance for the given dataset.
-    Computes token-level, word-level, and sample-level metrics.
-    """
-    model.to(device)
-    model.eval()
-    all_preds, all_labels = [], []
+###############################################################################
+# 5 ─────  EVALUATION  (token & sample thresholds)
+###############################################################################
+def eval_dataset(ds):
+    model.to(device); model.eval()
+    all_p, all_t, samp_scores = [], [], []
 
-    for batch in torch.utils.data.DataLoader(dataset, batch_size=16):
-        input_ids = torch.tensor(batch["input_ids"]).to(device)
-        attention_mask = torch.tensor(batch["attention_mask"]).to(device)
-        labels = batch["labels"]
+    loader = torch.utils.data.DataLoader(ds, batch_size=16, shuffle=False)
+    for batch in loader:
+        inp = torch.tensor(batch["input_ids"]).to(device)
+        msk = torch.tensor(batch["attention_mask"]).to(device)
+        lbl = torch.tensor(batch["labels"])                     # stay on CPU for list ops
         with torch.no_grad():
-            logits = model(input_ids=input_ids, attention_mask=attention_mask).logits
-        preds = torch.argmax(logits, dim=-1).cpu().tolist()
-        all_preds.extend(preds)
-        all_labels.extend(labels)
+            logits = model(input_ids=inp, attention_mask=msk).logits
+        preds = torch.argmax(logits, -1).cpu()
 
-    token_accs, sample_corrects = [], []
-    for pred, true in zip(all_preds, all_labels):
-        valid = [i for i, t in enumerate(true) if t != -100]
-        pred_valid = [pred[i] for i in valid]
-        true_valid = [true[i] for i in valid]
-        if len(pred_valid) != len(true_valid): continue
-        matches = [p == t for p, t in zip(pred_valid, true_valid)]
-        if matches:
-            token_accs.append(np.mean(matches))
-            sample_corrects.append(np.mean(matches))
+        for p, t in zip(preds, lbl):
+            valid = t != -100
+            pv, tv = p[valid].tolist(), t[valid].tolist()
+            if not pv: continue
+            match = [pi == ti for pi, ti in zip(pv, tv)]
+            all_p.extend(pv); all_t.extend(tv)
+            samp_scores.append(sum(match)/len(match))
 
+    def thr(x): return float(np.mean([s >= x for s in samp_scores])) if samp_scores else 0.0
     return {
-        'token_accuracy': float(np.mean(token_accs)) if token_accs else 0.0,
-        'sample_50': float(np.mean([x >= 0.5 for x in sample_corrects])),
-        'sample_70': float(np.mean([x >= 0.7 for x in sample_corrects])),
-        'sample_90': float(np.mean([x >= 0.9 for x in sample_corrects])),
-        'sample_100': float(np.mean([x == 1.0 for x in sample_corrects]))
+        "token_acc":   float(np.mean([p == t for p, t in zip(all_p, all_t)])) if all_p else 0.0,
+        "sample_50":   thr(0.50),
+        "sample_70":   thr(0.70),
+        "sample_90":   thr(0.90),
+        "sample_100":  thr(1.00),
     }
 
-# ========== 5. Plotting the Results ==========
+print("\n⚙️  Evaluating each strategy …")
+results = {s: eval_dataset(ds) for s, ds in dataset_by_strategy.items()}
 
-def plot_results(results_dict):
-    keys = list(results_dict.keys())
-    metrics = list(next(iter(results_dict.values())).keys())
-    for metric in metrics:
-        values = [results_dict[k][metric] for k in keys]
-        plt.figure(figsize=(10, 4))
-        plt.bar(keys, values)
-        plt.title(f"{metric} across perturbation strategies")
-        plt.xticks(rotation=30)
-        plt.ylim(0, 1)
-        plt.grid(True)
-        plt.tight_layout()
-        plt.show()
-
-# ========== 6. Running Perturbation and Evaluation ==========
-# Run experiments and collect results
-def run_all_perturbation_tests(base_dataset, model, tokenizer, id_to_label, label_to_id, device):
-    results = {}
-    datasets = create_dataset_by_strategy(base_dataset, tokenizer, label_to_id)
-    for strategy, ds in datasets.items():
-        print(f"Evaluating {strategy}")
-        res = evaluate_model(model, ds, id_to_label, device)
-        results[strategy] = res
-    return results
-
-# Assuming the variables like `test_dataset`, `model`, `tokenizer`, `id_to_label`, `label_to_id`, and `device` are already loaded
-results = run_all_perturbation_tests(test_dataset, model, tokenizer, id_to_label, label_to_id, device)
-
-# Plotting all results
-plot_results(results)
+###############################################################################
+# 6 ─────  PLOT RESULTS
+###############################################################################
+metrics = list(next(iter(results.values())).keys())
+for m in metrics:
+    plt.figure(figsize=(7,4))
+    plt.bar(results.keys(), [results[s][m] for s in results])
+    plt.title(f"{m} across perturbations")
+    plt.ylim(0,1)
+    plt.xticks(rotation=25)
+    plt.grid(axis="y", linestyle="--", alpha=0.5)
+    plt.tight_layout()
+    plt.show()

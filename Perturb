@@ -1,103 +1,113 @@
-# 🔧 Required Imports
-import torch
 import random
 import re
-from transformers import AutoTokenizer
+import numpy as np
+import matplotlib.pyplot as plt
+from copy import deepcopy
 
-# 🧠 Assumptions (you must define these in your codebase)
-# tokenizer = AutoTokenizer.from_pretrained("your_model_dir")
-# label_to_id = {'O': 0, 'B-Ticker': 1, 'I-Ticker': 2, 'B-Offer': 3, ...}
-# id_to_label = {v: k for k, v in label_to_id.items()}
-# max_length = 128
+# ========== Perturbation Functions ==========
 
-# 🛠️ Helper: Tokenize and align labels
-def tokenize_and_align_labels(text, original_labels, tokenizer, label_to_id, max_length=128):
-    words = text.split()
-    aligned_labels = []
-    for word in words:
-        subtokens = tokenizer.tokenize(word)
-        aligned_labels.extend([label_to_id['O']] * len(subtokens))
+def misspell_tickers(example):
+    text = example["text"]
+    if not text:
+        return example
+    # Randomly misspell a word labeled as Ticker (if any)
+    tokens = text.split()
+    indices = [i for i, l in enumerate(example['labels']) if id_to_label.get(l, '').endswith("Ticker")]
+    if indices:
+        i = random.choice(indices)
+        word = tokens[i]
+        if len(word) > 2:
+            tokens[i] = word[0] + word[2:]  # remove 2nd char
+        example["text"] = ' '.join(tokens)
+    return example
 
-    tokenized = tokenizer(
-        text,
-        padding='max_length',
-        truncation=True,
-        max_length=max_length,
-        return_tensors='pt'
+def misspell_numbers(example):
+    text = example["text"]
+    if not text:
+        return example
+    tokens = text.split()
+    for i, word in enumerate(tokens):
+        if word.replace('.', '', 1).isdigit() and len(word) > 1:
+            tokens[i] = word[:-1]  # remove last digit
+            break
+    example["text"] = ' '.join(tokens)
+    return example
+
+def insert_words(example):
+    text = example["text"]
+    if not text:
+        return example
+    insertables = ["foo", "bar", "hello"]
+    tokens = text.split()
+    new_tokens = []
+    for t in tokens:
+        new_tokens.append(t)
+        if random.random() < 0.2:
+            new_tokens.append(random.choice(insertables))
+    example["text"] = ' '.join(new_tokens)
+    return example
+
+def combined_all(example):
+    example = misspell_tickers(example)
+    example = misspell_numbers(example)
+    example = insert_words(example)
+    return example
+
+# ========== Perturbation Strategy Dictionary ==========
+
+perturbation_strategies = {
+    "NoPerturb": lambda x: x,  # identity
+    "Misspell_Ticker": misspell_tickers,
+    "Misspell_Number": misspell_numbers,
+    "Insert_Words": insert_words,
+    "Combined_All": combined_all
+}
+
+# ========== Apply Perturbations ==========
+
+dataset_by_strategy = {}
+for name, perturb_fn in perturbation_strategies.items():
+    print(f"[Perturbation] Applying: {name}")
+    perturbed_dataset = test_dataset.map(perturb_fn)
+    dataset_by_strategy[name] = perturbed_dataset
+
+# ========== Evaluate ==========
+
+results_by_strategy = {}
+for strategy_name, dataset in dataset_by_strategy.items():
+    print(f"[Evaluation] Running evaluation for: {strategy_name}")
+    result = evaluate_model(
+        model=model,
+        dataset=dataset,
+        tokenizer=tokenizer,
+        id_to_label=id_to_label,
+        label_to_id=label_to_id,
+        strategy_name=strategy_name,
+        device=device
     )
-    
-    labels = [-100] + aligned_labels[:max_length - 2] + [-100]
-    labels += [-100] * (max_length - len(labels))
-    
-    tokenized['labels'] = torch.tensor([labels])
-    return {
-        'text': text,
-        'input_ids': tokenized['input_ids'][0],
-        'attention_mask': tokenized['attention_mask'][0],
-        'labels': tokenized['labels'][0]
-    }
+    results_by_strategy[strategy_name] = result
 
-# ✏️ 1. Misspell ticker words
-def perturb_misspell_on_tickers(sample, tokenizer, label_to_id, id_to_label):
-    text = sample['text']
-    labels = sample['labels']
-    words = text.split()
+# ========== Plotting ==========
 
-    perturbed_words = []
-    label_ptr = 0
+metrics_to_plot = [
+    'token_accuracy', 'token_precision', 'token_recall', 'token_f1',
+    'sample_50', 'sample_60', 'sample_70', 'sample_80', 'sample_90', 'sample_100',
+    'word_level_accuracy'
+]
 
-    for word in words:
-        subtokens = tokenizer.tokenize(word)
-        group_labels = []
-        for _ in subtokens:
-            if label_ptr >= len(labels): break
-            group_labels.append(labels[label_ptr])
-            label_ptr += 1
-
-        label_names = [id_to_label.get(lbl, 'O') for lbl in group_labels if lbl != -100]
-        if any('Ticker' in lbl for lbl in label_names) and len(word) > 2:
-            word = word[0] + word[-1] + word[2:-1] if len(word) > 3 else word[::-1]
-
-        perturbed_words.append(word)
-
-    new_text = " ".join(perturbed_words)
-    return tokenize_and_align_labels(new_text, labels, tokenizer, label_to_id)
-
-# 🔢 2. Misspell numbers
-def perturb_misspell_on_numbers(sample, tokenizer, label_to_id):
-    text = sample['text']
-    labels = sample['labels']
-    words = text.split()
-
-    new_words = []
-    for word in words:
-        new_word = re.sub(r'\d+', lambda m: m.group(0)[::-1], word)
-        new_words.append(new_word)
-
-    new_text = " ".join(new_words)
-    return tokenize_and_align_labels(new_text, labels, tokenizer, label_to_id)
-
-# 🧩 3. Insert words between main words
-def perturb_insert_words_between_main_words(sample, tokenizer, label_to_id, insert_words=None):
-    if insert_words is None:
-        insert_words = ['foo', 'bar', 'baz']
-
-    text = sample['text']
-    labels = sample['labels']
-    original_words = text.split()
-
-    new_words = []
-    for i, word in enumerate(original_words):
-        new_words.append(word)
-        if i < len(original_words) - 1:
-            new_words.append(random.choice(insert_words))
-
-    new_text = " ".join(new_words)
-    return tokenize_and_align_labels(new_text, labels, tokenizer, label_to_id)
-
-# 🔀 4. Combined All
-def perturb_combined_all(sample, tokenizer, label_to_id, id_to_label):
-    sample = perturb_misspell_on_tickers(sample, tokenizer, label_to_id, id_to_label)
-    sample = perturb_misspell_on_numbers(sample, tokenizer, label_to_id)
-    sample = perturb_insert_words_between_main_words(sample, tokenizer, label_to_id)
-    return sample
+for metric in metrics_to_plot:
+    values, labels = [], []
+    for strategy, result in results_by_strategy.items():
+        if metric in result:
+            values.append(result[metric])
+            labels.append(strategy)
+    if values:
+        plt.figure(figsize=(8, 4))
+        plt.bar(labels, values)
+        plt.title(f"{metric.replace('_', ' ').title()} Across Perturbation Strategies")
+        plt.ylabel("Score")
+        plt.xticks(rotation=30)
+        plt.ylim(0, 1)
+        plt.tight_layout()
+        plt.grid(axis="y", linestyle="--", alpha=0.4)
+        plt.show()

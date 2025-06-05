@@ -1,0 +1,108 @@
+import torch, numpy as np, pandas as pd, matplotlib.pyplot as plt
+from datasets import Dataset
+from tqdm.auto import tqdm
+from collections import defaultdict
+from sklearn.metrics import accuracy_score, precision_recall_fscore_support
+
+###############################################################################
+# 1 ──  STRICT WORD-LEVEL & SAMPLE-LEVEL EVALUATOR
+###############################################################################
+def evaluate(model, dataset, tok, strict=True, sample_thr=(.5,.7,.9,1.0)):
+    model.to(device).eval()
+    t_pred, t_true = [], []
+    w_pred, w_true = [], []
+    samp_scores    = []
+
+    collate = lambda b:{k:[d[k] for d in b] for k in b[0]}
+    loader  = torch.utils.data.DataLoader(dataset, batch_size=32, shuffle=False,
+                                          collate_fn=collate)
+
+    with torch.no_grad():
+        for batch in loader:
+            ids = torch.tensor(batch["input_ids"]).to(device)
+            msk = torch.tensor(batch["attention_mask"]).to(device)
+            true=batch["labels"]; texts=batch.get("text", [""]*len(true))
+            pred=model(ids,attention_mask=msk).logits.argmax(-1).cpu().tolist()
+
+            for pv,tv,txt in zip(pred,true,texts):
+                valid=[i for i,l in enumerate(tv) if l!=-100]
+                if not valid: continue
+                pv_f=[pv[i] for i in valid]; tv_f=[tv[i] for i in valid]
+                t_pred.extend(pv_f); t_true.extend(tv_f)
+
+                # strict word correctness
+                wid=tok(txt,return_offsets_mapping=True,padding="max_length",
+                        max_length=128,truncation=True).word_ids()
+                bucket_p, bucket_t = defaultdict(list), defaultdict(list)
+                for i in valid:
+                    wid_i=wid[i]; 
+                    if wid_i is not None:
+                        bucket_p[wid_i].append(pv[i]); bucket_t[wid_i].append(tv[i])
+                for wid_i in bucket_p:
+                    token_pairs=list(zip(bucket_p[wid_i],bucket_t[wid_i]))
+                    pred_lbl = bucket_t[wid_i][0] if all(a==b for a,b in token_pairs) \
+                               else label_to_id['ERR']
+                    w_pred.append(pred_lbl); w_true.append(bucket_t[wid_i][0])
+
+                samp_scores.append(sum(int(a==b) for a,b in zip(pv_f,tv_f))/len(tv_f))
+
+    def macro(tr,pr):
+        acc=accuracy_score(tr,pr) if tr else 0.
+        P,R,F,_=precision_recall_fscore_support(tr,pr,average='macro',zero_division=0) if tr else (0,0,0,0)
+        return acc,P,R,F
+
+    t_acc,t_pr,t_rc,t_f1 = macro(t_true,t_pred)
+    w_acc,w_pr,w_rc,w_f1 = macro(w_true,w_pred)
+    pass_rates={f"sample≥{int(th*100)}%": float(np.mean([s>=th for s in samp_scores]))
+                for th in sample_thr}
+    return {
+        "tok_acc":t_acc,"tok_prec":t_pr,"tok_rec":t_rc,"tok_f1":t_f1,
+        "word_acc":w_acc,"word_prec":w_pr,"word_rec":w_rc,"word_f1":w_f1,
+        **pass_rates
+    }
+
+###############################################################################
+# 2 ──  TOKEN-LABEL ALIGNERS  (prod uses original, baseline converts)
+###############################################################################
+def distil_align_dataset(base_ds):
+    # helper defined earlier: encode_distil(text, old_token_labels)
+    rec={"input_ids":[],"attention_mask":[],"labels":[]}
+    for ex in tqdm(base_ds,desc="Align→Distil"):
+        al=encode_distil(ex["text"], ex["labels"])
+        for k in rec: rec[k].append(al[k])
+    rec["text"]=[ex["text"] for ex in base_ds]
+    return Dataset.from_dict(rec)
+
+# build test sets once
+test_sets_prod   = {n: ds for n,ds in strategies.items()}   # placeholder init
+test_sets_baseln = {}
+for name, fn in strategies.items():
+    if name=="NoPerturb":
+        prod_ds   = test_dataset
+        base_ds   = distil_align_dataset(test_dataset)
+    else:
+        pert      = test_dataset.map(lambda ex: fn(deepcopy(ex)))
+        prod_ds   = pert
+        base_ds   = distil_align_dataset(pert)
+    test_sets_prod[name]   = prod_ds
+    test_sets_baseln[name] = base_ds
+
+###############################################################################
+# 3 ──  RUN EVALUATIONS
+###############################################################################
+metrics_prod  = {}
+metrics_base  = {}
+for name in strategies:
+    print(f"Evaluating {name} …")
+    metrics_prod[name] = evaluate(old_model,      test_sets_prod[name],   tokenizer)
+    metrics_base[name] = evaluate(baseline_model, test_sets_baseln[name], baseline_tokenizer)
+
+###############################################################################
+# 4 ──  COMBINE & DISPLAY
+###############################################################################
+prod_df  = pd.DataFrame(metrics_prod ).T.add_prefix("Prod_")
+base_df  = pd.DataFrame(metrics_base ).T.add_prefix("Base_")
+cmp_df   = pd.concat([prod_df, base_df], axis=1).round(4)
+
+print("\n=== TOKEN / WORD / SAMPLE METRIC COMPARISON ===")
+display(cmp_df)

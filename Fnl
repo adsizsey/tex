@@ -1,120 +1,135 @@
 ###############################################################################
-# 0. GEREKLİ DEĞİŞKENLERİN VAR OLDUĞU KABUL EDİLİYOR
-#    model • tokenizer • test_dataset • id_to_label • label_to_id • device
+# 0 ── REQUIRED GLOBALS (already in notebook):
+#     model, tokenizer, test_dataset, id_to_label, label_to_id, device
 ###############################################################################
-
 import random, re, torch, numpy as np, matplotlib.pyplot as plt
 from datasets import Dataset
 from copy import deepcopy
 from tqdm.auto import tqdm
 
 ###############################################################################
-# 1. PERTURBATION FONKSİYONLARI
+# 1 ── PERTURBATION FUNCTIONS
 ###############################################################################
-def misspell_tickers(ex):
+def p_misspell_tickers(ex):
+    """Naively corrupt the first ALL-CAPS word ≥3 chars."""
     words = ex["text"].split()
-    for i, lid in enumerate(ex["labels"]):
-        if lid != -100 and id_to_label[lid].endswith("Ticker") and len(words[i]) > 2:
-            words[i] = words[i][0] + words[i][2:]
+    for i, w in enumerate(words):
+        if w.isupper() and len(w) > 2:          # crude ticker heuristic
+            words[i] = w[0] + w[2:]            # drop second char
             break
-    ex["text"] = " ".join(words)
-    return ex
+    ex["text"] = " ".join(words);  return ex
 
-def misspell_numbers(ex):
+def p_misspell_numbers(ex):
     words = ex["text"].split()
     for i, w in enumerate(words):
         if w.replace('.','',1).isdigit() and len(w) > 2:
-            words[i] = w[:-1]
+            words[i] = w[:-1]                  # drop last digit
             break
-    ex["text"] = " ".join(words)
-    return ex
+    ex["text"] = " ".join(words);  return ex
 
-def insert_words(ex, ins=("foo","bar","baz")):
+def p_insert_words(ex, insertables=("foo","bar","baz")):
     out=[]
     for w in ex["text"].split():
         out.append(w)
-        if random.random() < .2:
-            out.append(random.choice(ins))
-    ex["text"] = " ".join(out); return ex
+        if random.random() < 0.20: out.append(random.choice(insertables))
+    ex["text"] = " ".join(out);  return ex
 
-def combined_all(ex):
-    return insert_words(misspell_numbers(misspell_tickers(ex)))
+def p_combined(ex):   # chained
+    return p_insert_words(p_misspell_numbers(p_misspell_tickers(ex)))
 
 strategies = {
     "NoPerturb"      : lambda x: x,
-    "MisspellTicker" : misspell_tickers,
-    "MisspellNumber" : misspell_numbers,
-    "InsertWords"    : insert_words,
-    "CombinedAll"    : combined_all
+    "MisspellTicker" : p_misspell_tickers,
+    "MisspellNumber" : p_misspell_numbers,
+    "InsertWords"    : p_insert_words,
+    "CombinedAll"    : p_combined
 }
 
 ###############################################################################
-# 2. TOKENIZE + LABEL HİZALAMA
+# 2 ── TOKENIZE & ALIGN  (keep CLS/SEP/PAD = -100, new tokens = 'O')
 ###############################################################################
-def align(text, word_labels, max_len=128):
-    tok = tokenizer(text, truncation=True, padding='max_length',
-                    max_length=max_len, return_offsets_mapping=True)
-    wids = tok.word_ids()
-    tok["labels"] = [
-        -100 if wid is None else (
-            word_labels[wid] if wid < len(word_labels) else label_to_id["O"]
-        )
-        for wid in wids
-    ]
-    tok.pop("offset_mapping")
-    return tok
+def tok_align(text:str, old_token_labels:list[int], max_len:int=128):
+    core_old = [lab for lab in old_token_labels[1:-1] if lab != -100]  # strip CLS/SEP
+    enc = tokenizer(text, truncation=True, padding='max_length',
+                    max_length=max_len, return_tensors=None)
+    new_ids = enc["input_ids"]
+    new_lab = [-100]                   # CLS
+    ptr = 0
+    for tok_id in new_ids[1:-1]:
+        if ptr < len(core_old):
+            new_lab.append(core_old[ptr]); ptr += 1
+        else:
+            new_lab.append(label_to_id["O"])          # brand-new token
+    new_lab.append(-100)                              # SEP
+    if len(new_lab) < max_len:
+        new_lab.extend([-100]*(max_len-len(new_lab)))
+    enc["labels"] = new_lab
+    return enc
 
 ###############################################################################
-# 3. HER STRATEJİ İÇİN DATASET OLUŞTUR
+# 3 ── BUILD DATASETS PER STRATEGY
 ###############################################################################
-def build_sets(base):
+def build_datasets(base_ds):
     out={}
-    for n,fn in strategies.items():
-        print(f"→ {n}")
-        pert = base.map(lambda ex: fn(deepcopy(ex)))
-        cols={"input_ids":[],"attention_mask":[],"labels":[],"text":[]}
-        for ex in tqdm(pert, desc=n):
-            aligned = align(ex["text"], ex["labels"])
-            for k in cols: cols[k].append(aligned[k] if k!="text" else ex["text"])
-        out[n]=Dataset.from_dict(cols)
+    for name,fn in strategies.items():
+        print(f"🛠  Perturbing  → {name}")
+        pert = base_ds.map(lambda ex: fn(deepcopy(ex)))
+        rec  = {k:[] for k in ["input_ids","attention_mask","labels","text"]}
+        for ex in tqdm(pert, desc=name):
+            aligned = tok_align(ex["text"], ex["labels"])
+            rec["input_ids"].append(aligned["input_ids"])
+            rec["attention_mask"].append(aligned["attention_mask"])
+            rec["labels"].append(aligned["labels"])
+            rec["text"].append(ex["text"])
+        out[name] = Dataset.from_dict(rec)
     return out
 
 ###############################################################################
-# 4. EVALUASYON (tensor-bool mask hatası yok)
+# 4 ── EVALUATION  (token acc & sample thresholds)
 ###############################################################################
 def eval_set(ds):
     model.to(device).eval()
-    tok_acc, samp = [], []
+    tok_scores, samp_scores = [], []
+
     loader = torch.utils.data.DataLoader(
         ds, batch_size=16, shuffle=False,
-        collate_fn=lambda b:{k:[d[k] for d in b] for k in b[0]}
+        collate_fn=lambda b:{k:[d[k] for d in b] for k in b[0]}  # keep lists!
     )
     with torch.no_grad():
         for batch in loader:
             ids = torch.tensor(batch["input_ids"]).to(device)
             msk = torch.tensor(batch["attention_mask"]).to(device)
-            true= batch["labels"]                        # list of list
-            preds= model(ids,attention_mask=msk).logits.argmax(-1).cpu().tolist()
-            for pv,tv in zip(preds,true):
-                idx=[i for i,l in enumerate(tv) if l!=-100]
-                if not idx: continue
-                match=[int(pv[i]==tv[i]) for i in idx]
-                score=sum(match)/len(match)
-                tok_acc.append(score); samp.append(score)
-    avg=lambda x: float(np.mean(x)) if x else 0.0
-    pr = lambda thr: avg([s>=thr for s in samp])
-    return {"token_acc":avg(tok_acc),"sample_50":pr(.5),
-            "sample_70":pr(.7),"sample_90":pr(.9),"sample_100":pr(1.0)}
+            true = batch["labels"]                         # list-of-list
+
+            preds = model(ids, attention_mask=msk).logits.argmax(-1).cpu().tolist()
+            for pv, tv in zip(preds, true):
+                valid = [i for i,l in enumerate(tv) if l!=-100]
+                if not valid: continue
+                matches = [pv[i]==tv[i] for i in valid]
+                score = sum(matches)/len(matches)
+                tok_scores.append(score); samp_scores.append(score)
+
+    mean = lambda x: float(np.mean(x)) if x else 0.0
+    rate = lambda th: mean([s>=th for s in samp_scores])
+    return {
+        "token_accuracy": mean(tok_scores),
+        "sample≥50%"   : rate(0.50),
+        "sample≥70%"   : rate(0.70),
+        "sample≥90%"   : rate(0.90),
+        "sample=100%"  : rate(1.00)
+    }
 
 ###############################################################################
-# 5. TÜMÜNÜ ÇALIŞTIR VE ÇİZ
+# 5 ── RUN & PLOT
 ###############################################################################
-datasets = build_sets(test_dataset)
+datasets = build_datasets(test_dataset)
 results  = {n:eval_set(ds) for n,ds in datasets.items()}
 
-for m in results[next(iter(results))]:
+for met in results[next(iter(results))]:
     plt.figure(figsize=(7,4))
-    plt.bar(results.keys(), [results[k][m] for k in results])
-    plt.title(f"{m} vs perturbasyon")
-    plt.ylim(0,1); plt.xticks(rotation=25); plt.grid(axis='y',ls='--',alpha=.4)
+    plt.bar(results.keys(), [results[k][met] for k in results], color="steelblue")
+    plt.title(f"{met} Across Perturbations")
+    plt.ylabel("Score"); plt.ylim(0,1)
+    plt.xticks(rotation=25)
+    plt.grid(axis='y', ls='--', alpha=.4)
     plt.tight_layout(); plt.show()

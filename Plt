@@ -1,0 +1,45 @@
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+
+# ------------------------------------------------------------------
+# Turn `results` into a tidy DataFrame
+# ------------------------------------------------------------------
+df = pd.DataFrame(results).T   # strategies = rows
+df.index.name = "strategy"
+
+# ── 1. ACCURACY COMBO  (token / word / sample≥70%)
+acc_cols = ["token_acc", "word_acc", "sample≥70%"]
+acc_df   = df[acc_cols]
+
+x = np.arange(len(acc_df))                     # strategies
+bar_w = 0.25
+fig, ax = plt.subplots(figsize=(9,4))
+for j,col in enumerate(acc_cols):
+    ax.bar(x + j*bar_w, acc_df[col], width=bar_w, label=col)
+
+ax.set_xticks(x + bar_w)
+ax.set_xticklabels(acc_df.index, rotation=25)
+ax.set_ylim(0,1); ax.set_ylabel("Accuracy")
+ax.set_title("Token vs Word vs Sample≥70% Accuracy")
+ax.grid(axis='y', ls='--', alpha=.5)
+ax.legend(); fig.tight_layout(); plt.show()
+
+# ── 2. PRECISION-RECALL-F1 COMBO  (token vs word)
+prf_cols = {
+    "Precision": ("token_prec","word_prec"),
+    "Recall"   : ("token_rec" ,"word_rec" ),
+    "F1"       : ("token_f1"  ,"word_f1"  )
+}
+
+bar_w = 0.18
+for metric, (tok_col, word_col) in prf_cols.items():
+    fig, ax = plt.subplots(figsize=(9,4))
+    ax.bar(x       , df[tok_col] , width=bar_w, label="Token")
+    ax.bar(x+bar_w , df[word_col], width=bar_w, label="Word" )
+    ax.set_xticks(x + bar_w/2)
+    ax.set_xticklabels(df.index, rotation=25)
+    ax.set_ylim(0,1); ax.set_ylabel(metric)
+    ax.set_title(f"{metric} – Token vs Word Level")
+    ax.grid(axis='y', ls='--', alpha=.5)
+    ax.legend(); fig.tight_layout(); plt.show()

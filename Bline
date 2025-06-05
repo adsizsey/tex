@@ -22,8 +22,24 @@ warnings.filterwarnings("ignore")
 # 1 ──  LOAD DISTILBERT BASELINE (local folder: ./distilbert_base/)
 ###############################################################################
 base_path = "./distilbert_base"
+from transformers import AutoConfig, DistilBertForTokenClassification
+
+num_labels = len(label_to_id)               # e.g. 15
+
+cfg = AutoConfig.from_pretrained(
+    "./distilbert_base",
+    num_labels=num_labels,
+    id2label=id_to_label,
+    label2id=label_to_id
+)
+
+baseline_model = DistilBertForTokenClassification.from_pretrained(
+    "./distilbert_base",
+    config=cfg,                 # fresh head → correct size
+    ignore_mismatched_sizes=True   # suppress old-head mismatch warning
+).to(device)
 baseline_tokenizer = DistilBertTokenizerFast.from_pretrained(base_path)
-baseline_model     = DistilBertForTokenClassification.from_pretrained(
+#baseline_model     = DistilBertForTokenClassification.from_pretrained(
     base_path, num_labels=len(label_to_id)
 ).to(device)
 

@@ -1,0 +1,76 @@
+from datasets import Dataset, DatasetDict
+from transformers import PreTrainedTokenizer
+import torch
+
+# Assuming test_dataset, tokenizer, id_to_label, label_to_id are already defined
+# We use only valid perturbation strategies defined by the user
+strategies = ["NoPerturb", "MisspellTicker", "MisspellNumber", "InsertWord"]
+
+# Sample perturbation functions
+def perturb_misspell(text: str, target: str = "ticker") -> str:
+    words = text.split()
+    perturbed = []
+    for w in words:
+        if target == "ticker" and w.isupper() and len(w) <= 5:
+            perturbed.append(w[::-1])  # naive misspelling: reverse
+        elif target == "number" and any(c.isdigit() for c in w):
+            perturbed.append(w.replace("1", "I").replace("0", "O"))
+        else:
+            perturbed.append(w)
+    return " ".join(perturbed)
+
+def perturb_insert(text: str) -> str:
+    words = text.split()
+    result = []
+    for w in words:
+        result.append(w)
+        result.append("xyz")  # insert a dummy word
+    return " ".join(result[:-1])
+
+# Realign token-level labels based on word-level labels
+def align_labels_with_tokenization(text: str, word_labels: list, tokenizer: PreTrainedTokenizer, label_to_id: dict):
+    encoding = tokenizer(text, return_offsets_mapping=True, truncation=True, padding="max_length", max_length=128)
+    word_ids = encoding.word_ids()
+    aligned = []
+    for wid in word_ids:
+        if wid is None or wid >= len(word_labels):
+            aligned.append(-100)
+        else:
+            aligned.append(label_to_id.get(word_labels[wid], label_to_id["O"]))
+    encoding["labels"] = aligned
+    return encoding
+
+# Build dataset_by_strategy dictionary
+def create_dataset_by_strategy(dataset, tokenizer, id_to_label, label_to_id):
+    dataset_by_strategy = {}
+
+    for strategy in strategies:
+        perturbed_inputs = []
+        for row in dataset:
+            orig_text = row["text"]
+            word_labels = [id_to_label[lid] for lid in row["labels"] if lid != -100]
+
+            # Apply strategy-specific perturbation
+            if strategy == "NoPerturb":
+                pert_text = orig_text
+            elif strategy == "MisspellTicker":
+                pert_text = perturb_misspell(orig_text, target="ticker")
+            elif strategy == "MisspellNumber":
+                pert_text = perturb_misspell(orig_text, target="number")
+            elif strategy == "InsertWord":
+                pert_text = perturb_insert(orig_text)
+            else:
+                continue
+
+            # Align labels
+            enc = align_labels_with_tokenization(pert_text, word_labels, tokenizer, label_to_id)
+            enc["text"] = pert_text
+            perturbed_inputs.append(enc)
+
+        dataset_by_strategy[strategy] = Dataset.from_list(perturbed_inputs)
+
+    return dataset_by_strategy
+
+# Test the result
+dataset_by_strategy = create_dataset_by_strategy(test_dataset, tokenizer, id_to_label, label_to_id)
+dataset_by_strategy["NoPerturb"][0]

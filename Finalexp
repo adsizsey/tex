@@ -1,0 +1,124 @@
+import torch
+from transformers import AutoModelForTokenClassification, AutoTokenizer
+from datasets import Dataset
+import numpy as np
+from collections import defaultdict
+from sklearn.metrics import precision_recall_fscore_support, accuracy_score
+
+# ========== Perturbation Strategies ==========
+def apply_perturbation_strategy(text, strategy_name):
+    if strategy_name == "NoPerturb":
+        return text
+    elif strategy_name == "MisspellTickers":
+        return text.replace("Apple", "Aplpe").replace("Google", "Gooogle")
+    elif strategy_name == "MisspellNumbers":
+        return text.replace("100", "10O").replace("200", "2O0")
+    elif strategy_name == "InsertWords":
+        words = text.split()
+        if len(words) > 2:
+            words.insert(1, "inserted")
+        return " ".join(words)
+    elif strategy_name == "Combined_All":
+        return apply_perturbation_strategy(
+            apply_perturbation_strategy(
+                apply_perturbation_strategy(text, "MisspellTickers"),
+                "MisspellNumbers"),
+            "InsertWords"
+        )
+    else:
+        raise ValueError(f"Unknown strategy: {strategy_name}")
+
+def create_dataset_by_strategy(dataset, strategy_names):
+    dataset_by_strategy = {}
+    for strategy in strategy_names:
+        perturbed_dataset = dataset.map(lambda x: {"text": apply_perturbation_strategy(x["text"], strategy)})
+        dataset_by_strategy[strategy] = perturbed_dataset
+    return dataset_by_strategy
+
+# ========== Evaluation Function ==========
+def evaluate_model(model, tokenizer, dataset_by_strategy, id_to_label, device):
+    strategy_metrics = defaultdict(dict)
+    model.to(device)
+
+    for strategy, dataset in dataset_by_strategy.items():
+        all_preds, all_labels = [], []
+        all_preds_word, all_labels_word = [], []
+        all_sample_results = defaultdict(list)
+
+        for example in dataset:
+            inputs = tokenizer(
+                example["text"],
+                return_tensors="pt",
+                truncation=True,
+                padding="max_length",
+                max_length=128,
+                return_offsets_mapping=True
+            )
+            inputs = {k: v.to(device) for k, v in inputs.items() if k != "offset_mapping"}
+            with torch.no_grad():
+                logits = model(**inputs).logits
+            preds = torch.argmax(logits, dim=-1).squeeze().cpu().numpy()
+            labels = np.array(example["labels"])
+            assert preds.shape[0] == labels.shape[0], f"Mismatch: preds={preds.shape[0]}, labels={labels.shape[0]}"
+            valid_mask = labels != -100
+            all_preds.extend(preds[valid_mask])
+            all_labels.extend(labels[valid_mask])
+
+            # Word-level
+            offsets = tokenizer(
+                example["text"],
+                return_offsets_mapping=True,
+                truncation=True,
+                padding="max_length",
+                max_length=128
+            )["offset_mapping"]
+            word_id_map = {}
+            word_idx = -1
+            for i, (start, end) in enumerate(offsets):
+                if start == 0 and end != 0:
+                    word_idx += 1
+                word_id_map[i] = word_idx
+
+            word_preds, word_labels = defaultdict(list), defaultdict(list)
+            for i in range(len(labels)):
+                if labels[i] == -100:
+                    continue
+                wid = word_id_map.get(i, -1)
+                if wid >= 0:
+                    word_preds[wid].append(preds[i])
+                    word_labels[wid].append(labels[i])
+            for wid in word_preds:
+                if word_labels[wid]:
+                    mode_pred = max(set(word_preds[wid]), key=word_preds[wid].count)
+                    mode_label = max(set(word_labels[wid]), key=word_labels[wid].count)
+                    all_preds_word.append(mode_pred)
+                    all_labels_word.append(mode_label)
+
+            correct_count = sum([
+                1 for wid in word_preds
+                if word_preds[wid] and word_labels[wid] and
+                max(set(word_preds[wid]), key=word_preds[wid].count) ==
+                max(set(word_labels[wid]), key=word_labels[wid].count)
+            ])
+            total_count = len(word_preds)
+            for thresh in range(50, 101, 10):
+                if total_count > 0:
+                    all_sample_results[thresh].append(correct_count / total_count >= (thresh / 100))
+
+        # Token metrics
+        prec, rec, f1, _ = precision_recall_fscore_support(all_labels, all_preds, average="macro", zero_division=0)
+        acc = accuracy_score(all_labels, all_preds)
+        strategy_metrics[strategy]["Token"] = {"Precision": prec, "Recall": rec, "F1": f1, "Accuracy": acc}
+
+        # Word metrics
+        prec, rec, f1, _ = precision_recall_fscore_support(all_labels_word, all_preds_word, average="macro", zero_division=0)
+        acc = accuracy_score(all_labels_word, all_preds_word)
+        strategy_metrics[strategy]["Word"] = {"Precision": prec, "Recall": rec, "F1": f1, "Accuracy": acc}
+
+        # Sample metrics
+        for thresh in range(50, 101, 10):
+            strategy_metrics[strategy][f"Sample@{thresh}%"] = {
+                "Accuracy": np.mean(all_sample_results[thresh])
+            }
+
+    return strategy_metrics

@@ -1,1 +1,181 @@
 
+import random, re, torch, numpy as np, matplotlib.pyplot as plt
+from datasets import Dataset
+from copy import deepcopy
+from tqdm.auto import tqdm
+from sklearn.metrics import accuracy_score, precision_recall_fscore_support
+from collections import defaultdict
+
+# ------------------------------------------------------------------
+# Ensure sentinel for wrong words
+# ------------------------------------------------------------------
+if 'ERR' not in label_to_id:
+    new_id = max(label_to_id.values()) + 1
+    label_to_id['ERR'] = new_id
+    id_to_label[new_id] = 'ERR'
+
+# ------------------------------------------------------------------
+# 1. PERTURBATIONS
+# ------------------------------------------------------------------
+def p_misspell_tickers(ex):
+    w = ex['text'].split()
+    for i,lid in enumerate(ex['labels']):
+        if lid!=-100 and id_to_label[lid].endswith('Ticker') and len(w[i])>2:
+            w[i]=w[i][0]+w[i][2:]; break
+    ex['text']=' '.join(w); return ex
+
+def p_misspell_numbers(ex):
+    w=ex['text'].split()
+    for i,t in enumerate(w):
+        if t.replace('.','',1).isdigit() and len(t)>2:
+            w[i]=t[:-1]; break
+    ex['text']=' '.join(w); return ex
+
+def p_insert_words(ex,ins=('foo','bar','baz')):
+    out=[]
+    for t in ex['text'].split():
+        out.append(t)
+        if random.random()<.2: out.append(random.choice(ins))
+    ex['text']=' '.join(out); return ex
+
+def p_combined(ex): return p_insert_words(p_misspell_numbers(p_misspell_tickers(ex)))
+
+strategies={
+    'NoPerturb':lambda x:x,
+    'MisspellTicker':p_misspell_tickers,
+    'MisspellNumber':p_misspell_numbers,
+    'InsertWords':p_insert_words,
+    'CombinedAll':p_combined
+}
+
+# ------------------------------------------------------------------
+# 2. TOKENIZE + ALIGN
+# ------------------------------------------------------------------
+def tok_align(txt, old_lab, max_len=128):
+    enc=tokenizer(txt,truncation=True,padding='max_length',max_length=max_len,return_tensors=None)
+    core=old_lab[1:-1]                         # keep 126 core tokens
+    new_lab=[-100]
+    ptr=0
+    for _ in enc['input_ids'][1:-1]:
+        new_lab.append(core[ptr] if ptr<len(core) else label_to_id['O'])
+        ptr+=1
+    new_lab.append(-100)
+    enc['labels']=new_lab
+    return enc
+
+# ------------------------------------------------------------------
+# 3. DATASETS PER STRATEGY
+# ------------------------------------------------------------------
+def build_sets(base):
+    out={}
+    for n,fn in strategies.items():
+        if n=='NoPerturb':
+            out[n]=base; continue
+        print('→',n)
+        pert=base.map(lambda ex: fn(deepcopy(ex)))
+        rec={k:[] for k in ['input_ids','attention_mask','labels','text']}
+        for ex in tqdm(pert,desc=n):
+            al=tok_align(ex['text'],ex['labels'])
+            for k in rec: rec[k].append(al[k] if k!='text' else ex['text'])
+        out[n]=Dataset.from_dict(rec)
+    return out
+
+# ------------------------------------------------------------------
+# 4. EVALUATION  (token, strict-word, sample)
+# ------------------------------------------------------------------
+def eval_set(ds):
+    model.to(device).eval()
+    tok_p,tok_t, w_p,w_t, samp=[] ,[],[],[],[]
+
+    loader=torch.utils.data.DataLoader(
+        ds,batch_size=16,shuffle=False,
+        collate_fn=lambda b:{k:[d[k] for d in b] for k in b[0]}
+    )
+    with torch.no_grad():
+        for batch in loader:
+            ids=torch.tensor(batch['input_ids']).to(device)
+            msk=torch.tensor(batch['attention_mask']).to(device)
+            true=batch['labels']; texts=batch['text']
+            pred=model(ids,attention_mask=msk).logits.argmax(-1).cpu().tolist()
+
+            for pv,tv,txt in zip(pred,true,texts):
+                valid=[i for i,l in enumerate(tv) if l!=-100]
+                if not valid: continue
+                pv_f=[pv[i] for i in valid]; tv_f=[tv[i] for i in valid]
+                tok_p.extend(pv_f); tok_t.extend(tv_f)
+                samp.append(sum(int(a==b) for a,b in zip(pv_f,tv_f))/len(tv_f))
+
+                # strict word-level
+                wid_map=tokenizer(txt,return_offsets_mapping=True,
+                                  padding='max_length',max_length=128,truncation=True).word_ids()
+                buckets=defaultdict(list)
+                for i in valid:
+                    wid=wid_map[i]
+                    if wid is not None: buckets[wid].append((pv[i],tv[i]))
+
+                for wid,pairs in buckets.items():
+                    pred_tokens, true_tokens = zip(*pairs)
+                    true_lbl = true_tokens[0]            # all true tokens equal by construction
+                    if all(p==t for p,t in pairs):
+                        pred_lbl = true_lbl              # correct
+                    else:
+                        pred_lbl = label_to_id['ERR']    # sentinel for incorrect
+                    w_p.append(pred_lbl); w_t.append(true_lbl)
+
+    # metrics
+    def macro(tr,pr):
+        acc=accuracy_score(tr,pr) if tr else 0.
+        P,R,F,_=precision_recall_fscore_support(tr,pr,average='macro',zero_division=0) if tr else (0,0,0,0)
+        return acc,P,R,F
+    ta,tp,tr,tf = macro(tok_t,tok_p)
+    wa,wp,wr,wf = macro(w_t ,w_p )
+    rate=lambda th: np.mean([s>=th for s in samp]) if samp else 0.
+    return {
+        'token_acc':ta,'token_prec':tp,'token_rec':tr,'token_f1':tf,
+        'word_acc':wa,'word_prec':wp,'word_rec':wr,'word_f1':wf,
+        'sample≥50%':rate(.5),'sample≥70%':rate(.7),
+        'sample≥90%':rate(.9),'sample=100%':rate(1.)
+    }
+
+# ------------------------------------------------------------------
+# 5. RUN & PLOT
+# ------------------------------------------------------------------
+datasets=build_sets(test_dataset)
+results ={n:eval_set(ds) for n,ds in datasets.items()}
+
+# combined bar-group plots
+import pandas as pd
+df=pd.DataFrame(results).T
+
+# a) Accuracy combo
+fig,ax=plt.subplots(figsize=(8,4))
+bw=.25; x=np.arange(len(df))
+ax.bar(x     ,df['token_acc'],width=bw,label='Token Acc')
+ax.bar(x+bw  ,df['word_acc'] ,width=bw,label='Word Acc (strict)')
+ax.bar(x+2*bw,df['sample≥70%'],width=bw,label='Sample ≥70%')
+ax.set_xticks(x+bw); ax.set_xticklabels(df.index,rotation=20)
+ax.set_ylim(0,1); ax.set_ylabel('Accuracy')
+ax.set_title('Accuracy – Token vs Strict-Word vs Sample ≥70%')
+ax.grid(axis='y',ls='--',alpha=.4); ax.legend(); plt.tight_layout(); plt.show()
+
+# b) Precision / Recall / F1 (token vs word)
+for base,tk,wd in [('Precision','token_prec','word_prec'),
+                   ('Recall'   ,'token_rec' ,'word_rec' ),
+                   ('F1'       ,'token_f1'  ,'word_f1'  )]:
+    plt.figure(figsize=(8,4))
+    plt.bar(x     ,df[tk],width=bw,label='Token')
+    plt.bar(x+bw  ,df[wd],width=bw,label='Word (strict)')
+    plt.xticks(x+bw/2,df.index,rotation=20)
+    plt.ylim(0,1); plt.ylabel(base)
+    plt.title(f'{base} – Token vs Strict Word')
+    plt.grid(axis='y',ls='--',alpha=.4); plt.legend(); plt.tight_layout(); plt.show()
+
+# c) Sample threshold pass-rates
+plt.figure(figsize=(8,4))
+thr_cols=['sample≥50%','sample≥70%','sample≥90%','sample=100%']
+for j,col in enumerate(thr_cols):
+    plt.bar(x+j*bw,df[col],width=bw,label=col)
+plt.xticks(x+1.5*bw,df.index,rotation=20)
+plt.ylim(0,1); plt.ylabel('Pass-Rate')
+plt.title('Sample-Level Pass-Rates by Threshold')
+plt.grid(axis='y',ls='--',alpha=.4); plt.legend(); plt.tight_layout(); plt.show()

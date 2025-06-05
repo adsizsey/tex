@@ -1,0 +1,103 @@
+# 🔧 Required Imports
+import torch
+import random
+import re
+from transformers import AutoTokenizer
+
+# 🧠 Assumptions (you must define these in your codebase)
+# tokenizer = AutoTokenizer.from_pretrained("your_model_dir")
+# label_to_id = {'O': 0, 'B-Ticker': 1, 'I-Ticker': 2, 'B-Offer': 3, ...}
+# id_to_label = {v: k for k, v in label_to_id.items()}
+# max_length = 128
+
+# 🛠️ Helper: Tokenize and align labels
+def tokenize_and_align_labels(text, original_labels, tokenizer, label_to_id, max_length=128):
+    words = text.split()
+    aligned_labels = []
+    for word in words:
+        subtokens = tokenizer.tokenize(word)
+        aligned_labels.extend([label_to_id['O']] * len(subtokens))
+
+    tokenized = tokenizer(
+        text,
+        padding='max_length',
+        truncation=True,
+        max_length=max_length,
+        return_tensors='pt'
+    )
+    
+    labels = [-100] + aligned_labels[:max_length - 2] + [-100]
+    labels += [-100] * (max_length - len(labels))
+    
+    tokenized['labels'] = torch.tensor([labels])
+    return {
+        'text': text,
+        'input_ids': tokenized['input_ids'][0],
+        'attention_mask': tokenized['attention_mask'][0],
+        'labels': tokenized['labels'][0]
+    }
+
+# ✏️ 1. Misspell ticker words
+def perturb_misspell_on_tickers(sample, tokenizer, label_to_id, id_to_label):
+    text = sample['text']
+    labels = sample['labels']
+    words = text.split()
+
+    perturbed_words = []
+    label_ptr = 0
+
+    for word in words:
+        subtokens = tokenizer.tokenize(word)
+        group_labels = []
+        for _ in subtokens:
+            if label_ptr >= len(labels): break
+            group_labels.append(labels[label_ptr])
+            label_ptr += 1
+
+        label_names = [id_to_label.get(lbl, 'O') for lbl in group_labels if lbl != -100]
+        if any('Ticker' in lbl for lbl in label_names) and len(word) > 2:
+            word = word[0] + word[-1] + word[2:-1] if len(word) > 3 else word[::-1]
+
+        perturbed_words.append(word)
+
+    new_text = " ".join(perturbed_words)
+    return tokenize_and_align_labels(new_text, labels, tokenizer, label_to_id)
+
+# 🔢 2. Misspell numbers
+def perturb_misspell_on_numbers(sample, tokenizer, label_to_id):
+    text = sample['text']
+    labels = sample['labels']
+    words = text.split()
+
+    new_words = []
+    for word in words:
+        new_word = re.sub(r'\d+', lambda m: m.group(0)[::-1], word)
+        new_words.append(new_word)
+
+    new_text = " ".join(new_words)
+    return tokenize_and_align_labels(new_text, labels, tokenizer, label_to_id)
+
+# 🧩 3. Insert words between main words
+def perturb_insert_words_between_main_words(sample, tokenizer, label_to_id, insert_words=None):
+    if insert_words is None:
+        insert_words = ['foo', 'bar', 'baz']
+
+    text = sample['text']
+    labels = sample['labels']
+    original_words = text.split()
+
+    new_words = []
+    for i, word in enumerate(original_words):
+        new_words.append(word)
+        if i < len(original_words) - 1:
+            new_words.append(random.choice(insert_words))
+
+    new_text = " ".join(new_words)
+    return tokenize_and_align_labels(new_text, labels, tokenizer, label_to_id)
+
+# 🔀 4. Combined All
+def perturb_combined_all(sample, tokenizer, label_to_id, id_to_label):
+    sample = perturb_misspell_on_tickers(sample, tokenizer, label_to_id, id_to_label)
+    sample = perturb_misspell_on_numbers(sample, tokenizer, label_to_id)
+    sample = perturb_insert_words_between_main_words(sample, tokenizer, label_to_id)
+    return sample

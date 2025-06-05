@@ -1,0 +1,55 @@
+# ------------------------------------------------------------------
+# 0. Config & model with fresh classification head
+# ------------------------------------------------------------------
+num_labels = len(label_to_id)
+
+from transformers import AutoConfig, DistilBertForTokenClassification
+
+cfg = AutoConfig.from_pretrained(
+    "./distilbert_base",
+    num_labels=num_labels,
+    id2label=id_to_label,
+    label2id=label_to_id
+)
+
+baseline_model = DistilBertForTokenClassification.from_pretrained(
+    "./distilbert_base",
+    config=cfg,
+    ignore_mismatched_sizes=True     # drop old 2-class head, init new
+)
+
+# ------------------------------------------------------------------
+# 1. Data-collator (CPU tensors only – no .to(device)!)
+# ------------------------------------------------------------------
+def data_collator(features):
+    return {
+        "input_ids":      torch.tensor([f["input_ids"]      for f in features], dtype=torch.long),
+        "attention_mask": torch.tensor([f["attention_mask"] for f in features], dtype=torch.long),
+        "labels":         torch.tensor([f["labels"]         for f in features], dtype=torch.long),
+    }
+
+# ------------------------------------------------------------------
+# 2. TrainingArguments & Trainer
+# ------------------------------------------------------------------
+from transformers import TrainingArguments, Trainer
+training_args = TrainingArguments(
+    output_dir="./distilbert_baseline_ckpt",
+    per_device_train_batch_size=16,
+    per_device_eval_batch_size=16,
+    learning_rate=5e-5,
+    num_train_epochs=2,
+    weight_decay=0.01,
+    logging_steps=100,
+    evaluation_strategy="no",
+    save_strategy="no"
+)
+
+trainer = Trainer(
+    model=baseline_model,
+    args=training_args,
+    train_dataset=train_ds_distil,
+    data_collator=data_collator,
+)
+
+print("⚙️  Training DistilBERT baseline …")
+trainer.train()   #  ← no pin_memory error now

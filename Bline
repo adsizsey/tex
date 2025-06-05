@@ -1,0 +1,148 @@
+###############################################################################
+# 0 ──  ASSUMED GLOBALS (already defined in notebook)
+#       old_model,      old_tokenizer            ← production objects
+#       train_dataset,  test_dataset             ← original 128-token format
+#       label_to_id,    id_to_label              ← same mapping as before
+#       device                                  ← torch.device("cuda") / ("cpu")
+###############################################################################
+
+import torch, numpy as np, random, os, warnings
+from datasets import Dataset
+from transformers import (DistilBertForTokenClassification, 
+                          DistilBertTokenizerFast, 
+                          TrainingArguments, Trainer)
+from sklearn.metrics import accuracy_score, precision_recall_fscore_support
+from tqdm.auto import tqdm
+from collections import defaultdict
+import pandas as pd
+
+warnings.filterwarnings("ignore")
+
+###############################################################################
+# 1 ──  LOAD DISTILBERT BASELINE (local folder: ./distilbert_base/)
+###############################################################################
+base_path = "./distilbert_base"
+baseline_tokenizer = DistilBertTokenizerFast.from_pretrained(base_path)
+baseline_model     = DistilBertForTokenClassification.from_pretrained(
+    base_path, num_labels=len(label_to_id)
+).to(device)
+
+###############################################################################
+# 2 ──  WORD-LABEL HELPER  (use old tokenizer)
+###############################################################################
+def make_word_labels(text:str, token_labels:list[int]):
+    """Return one label per word using old_tokenizer majority rule."""
+    wid_map = old_tokenizer(text, return_offsets_mapping=True,
+                            padding='max_length', max_length=128,
+                            truncation=True).word_ids()
+    bucket = defaultdict(list)
+    for tok_idx, wid in enumerate(wid_map):
+        if wid is None or token_labels[tok_idx] == -100:
+            continue
+        bucket[wid].append(token_labels[tok_idx])
+    word_labels=[]
+    for wid in range(max(bucket)+1):
+        if wid not in bucket:
+            word_labels.append(label_to_id['O'])
+        else:
+            # prefer first B_ / I_ label, else majority vote
+            lbls=bucket[wid]
+            chosen=next((l for l in lbls if id_to_label[l].startswith('B_')), lbls[0])
+            word_labels.append(chosen)
+    return word_labels
+
+###############################################################################
+# 3 ──  ALIGN WORD LABELS TO DISTILBERT TOKENS
+###############################################################################
+def encode_with_distil(text, old_token_labels):
+    word_labels = make_word_labels(text, old_token_labels)
+    enc = baseline_tokenizer(text, truncation=True, padding="max_length",
+                             max_length=128, return_offsets_mapping=True)
+    tok_lab=[]
+    for wid in enc.word_ids():
+        if wid is None:
+            tok_lab.append(-100)
+        else:
+            tok_lab.append(word_labels[wid] if wid < len(word_labels) else label_to_id['O'])
+    enc.pop("offset_mapping", None)
+    enc["labels"] = tok_lab
+    return enc
+
+###############################################################################
+# 4 ──  BUILD DISTIL TRAIN / TEST DATASETS
+###############################################################################
+def convert_dataset(orig_ds):
+    cols={"input_ids":[],"attention_mask":[],"labels":[]}
+    for sample in tqdm(orig_ds, desc="→ converting"):
+        al = encode_with_distil(sample["text"], sample["labels"])
+        cols["input_ids"].append(al["input_ids"])
+        cols["attention_mask"].append(al["attention_mask"])
+        cols["labels"].append(al["labels"])
+    return Dataset.from_dict(cols)
+
+train_ds_distil = convert_dataset(train_dataset)
+test_ds_distil  = convert_dataset(test_dataset)
+
+###############################################################################
+# 5 ──  TRAIN BASELINE DISTILBERT
+###############################################################################
+training_args = TrainingArguments(
+    output_dir="./distilbert_baseline_ckpt",
+    per_device_train_batch_size=16,
+    per_device_eval_batch_size=16,
+    learning_rate=5e-5,
+    num_train_epochs=2,
+    weight_decay=0.01,
+    logging_steps=100,
+    evaluation_strategy="no",
+    save_strategy="no"
+)
+
+def data_collator(batch):
+    return {
+        "input_ids":      torch.tensor([b["input_ids"] for b in batch]).to(device),
+        "attention_mask": torch.tensor([b["attention_mask"] for b in batch]).to(device),
+        "labels":         torch.tensor([b["labels"] for b in batch]).to(device)
+    }
+
+trainer = Trainer(
+    model=baseline_model,
+    args=training_args,
+    train_dataset=train_ds_distil,
+    data_collator=data_collator
+)
+
+print("⚙️  Training DistilBERT baseline …")
+trainer.train()
+
+###############################################################################
+# 6 ──  EVALUATION FUNCTION (token metrics only, strict)
+###############################################################################
+def evaluate(model, ds, tokenizer_ref):
+    model.eval(); preds_all=[]; labels_all=[]
+    loader = torch.utils.data.DataLoader(ds, batch_size=32, shuffle=False,
+        collate_fn=lambda b:{k:[d[k] for d in b] for k in b[0]})
+    with torch.no_grad():
+        for bt in loader:
+            ids = torch.tensor(bt["input_ids"]).to(device)
+            msk = torch.tensor(bt["attention_mask"]).to(device)
+            out = model(ids, attention_mask=msk).logits.argmax(-1).cpu().tolist()
+            for p,t in zip(out, bt["labels"]):
+                val_idx=[i for i,l in enumerate(t) if l!=-100]
+                preds_all.extend([p[i] for i in val_idx])
+                labels_all.extend([t[i] for i in val_idx])
+    acc=accuracy_score(labels_all, preds_all)
+    pr,rc,f1,_=precision_recall_fscore_support(labels_all, preds_all, average='macro', zero_division=0)
+    return {"accuracy":acc,"precision":pr,"recall":rc,"f1":f1}
+
+print("\n🔍  Evaluating production model …")
+prod_metrics  = evaluate(old_model,  test_dataset,     old_tokenizer)
+print("🔍  Evaluating DistilBERT baseline …")
+base_metrics  = evaluate(baseline_model, test_ds_distil, baseline_tokenizer)
+
+###############################################################################
+# 7 ──  RESULTS TABLE
+###############################################################################
+df = pd.DataFrame({"Production":prod_metrics, "DistilBaseline":base_metrics})
+print("\n=== TOKEN-LEVEL COMPARISON ===")
+display(df.T)

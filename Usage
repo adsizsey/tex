@@ -1,0 +1,50 @@
+# === FULL USAGE: Apply Perturbations, Evaluate, Plot ===
+
+# Step 1: Apply Perturbations
+from copy import deepcopy
+
+dataset_by_strategy = {}
+for name, perturb_fn in perturbation_strategies.items():
+    print(f"[Perturbation] Applying: {name}")
+    perturbed_dataset = test_dataset.map(perturb_fn) if not isinstance(test_dataset, list) else [perturb_fn(deepcopy(s)) for s in test_dataset]
+    dataset_by_strategy[name] = perturbed_dataset
+
+# Step 2: Evaluate Model on All Perturbations
+results_by_strategy = {}
+
+for strategy_name, perturbed_dataset in dataset_by_strategy.items():
+    print(f"[Evaluation] Running evaluation for: {strategy_name}")
+    result = evaluate_model(
+        model=model,
+        dataset=perturbed_dataset,
+        tokenizer=tokenizer,
+        id_to_label=id_to_label,
+        label_to_id=label_to_id,
+        strategy_name=strategy_name,
+        device=device  # must be 'cuda' or 'cpu'
+    )
+    results_by_strategy[strategy_name] = result
+
+# Step 3: Plot Key Metrics Across Strategies
+import matplotlib.pyplot as plt
+
+metrics_to_plot = ['token_accuracy', 'token_precision', 'token_recall', 'token_f1', 
+                   'sample_50', 'sample_60', 'sample_70', 'sample_80', 'sample_90', 'sample_100',
+                   'word_level_accuracy']
+
+for metric in metrics_to_plot:
+    values, labels = [], []
+    for strategy, result in results_by_strategy.items():
+        if metric in result:
+            values.append(result[metric])
+            labels.append(strategy)
+    if values:
+        plt.figure(figsize=(8, 4))
+        plt.bar(labels, values)
+        plt.title(f"{metric.replace('_', ' ').title()} Across Perturbation Strategies")
+        plt.ylabel("Score")
+        plt.xticks(rotation=30)
+        plt.ylim(0, 1)
+        plt.tight_layout()
+        plt.grid(axis="y", linestyle="--", alpha=0.4)
+        plt.show()

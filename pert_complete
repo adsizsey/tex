@@ -1,0 +1,106 @@
+import torch
+import numpy as np
+from collections import defaultdict
+from sklearn.metrics import accuracy_score, precision_recall_fscore_support
+from tqdm import tqdm
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+model.to(device)
+
+def encode_inputs(text, tokenizer):
+    encoded = tokenizer(
+        text,
+        padding="max_length",
+        truncation=True,
+        max_length=64,
+        return_tensors="pt"
+    )
+    return {k: v.to(device) for k, v in encoded.items()}
+
+def get_predictions(dataset, tokenizer, model, id_to_label):
+    predictions_all, labels_all, texts_all = [], [], []
+    for entry in tqdm(dataset, desc="Predicting"):
+        text = entry["text"]
+        labels = entry["labels"]
+        enc = encode_inputs(text, tokenizer)
+        with torch.no_grad():
+            logits = model(**enc).logits
+        preds = torch.argmax(logits, dim=-1).squeeze().cpu().tolist()
+        # Strip [CLS] and [SEP] if necessary
+        if len(preds) > len(labels):
+            preds = preds[1:len(labels)+1]
+        elif len(preds) < len(labels):
+            continue  # Skip corrupted sample
+        predictions_all.append(preds)
+        labels_all.append(labels)
+        texts_all.append(text)
+    return predictions_all, labels_all, texts_all
+
+def token_level_metrics(preds, labels):
+    flat_preds = sum(preds, [])
+    flat_labels = sum(labels, [])
+    acc = accuracy_score(flat_labels, flat_preds)
+    p, r, f, _ = precision_recall_fscore_support(flat_labels, flat_preds, average="macro", zero_division=0)
+    return acc, p, r, f
+
+def word_level_metrics(preds, labels, id_to_label):
+    matches = []
+    for pred_seq, label_seq in zip(preds, labels):
+        pred_words = []
+        label_words = []
+        prev_wid = -1
+        for pid, lid in zip(pred_seq, label_seq):
+            pred_lab = id_to_label.get(pid, "O")
+            true_lab = id_to_label.get(lid, "O")
+            pred_words.append(pred_lab)
+            label_words.append(true_lab)
+        match = [int(p == t) for p, t in zip(pred_words, label_words)]
+        matches.extend(match)
+    return sum(matches)/len(matches)
+
+def sample_level_metrics(preds, labels, thresholds=np.arange(0.5, 1.01, 0.1)):
+    results = {}
+    for thresh in thresholds:
+        correct = 0
+        for pred_seq, label_seq in zip(preds, labels):
+            match_count = sum(p == l for p, l in zip(pred_seq, label_seq))
+            ratio = match_count / len(label_seq)
+            if ratio >= thresh:
+                correct += 1
+        results[f"{int(thresh*100)}%"] = correct / len(preds)
+    return results
+
+def entity_level_metrics(preds, labels, id_to_label):
+    counts = defaultdict(lambda: [0, 0])  # [correct, total]
+    for pred_seq, label_seq in zip(preds, labels):
+        for p, l in zip(pred_seq, label_seq):
+            true_label = id_to_label.get(l, "O")
+            pred_label = id_to_label.get(p, "O")
+            if true_label != "O":
+                counts[true_label][1] += 1
+                if true_label == pred_label:
+                    counts[true_label][0] += 1
+    return {k: v[0]/v[1] if v[1] > 0 else 0 for k, v in counts.items()}
+
+# ======= Now run for multiple perturbation strategies =========
+all_metrics = {}
+strategies = ["None", "Misspell_Ticker", "Misspell_Number", "Insert_All", "Insert_Ticker", "Insert_Number", "Combined_All"]
+
+for strategy in strategies:
+    print(f"\nEvaluating: {strategy}")
+    dataset = dataset_by_strategy[strategy]
+    preds, labels, texts = get_predictions(dataset, tokenizer, model, id_to_label)
+    acc, p, r, f = token_level_metrics(preds, labels)
+    word_acc = word_level_metrics(preds, labels, id_to_label)
+    sample_metrics = sample_level_metrics(preds, labels)
+    entity_metrics = entity_level_metrics(preds, labels, id_to_label)
+
+    all_metrics[strategy] = {
+        "token_accuracy": acc,
+        "token_precision": p,
+        "token_recall": r,
+        "token_f1": f,
+        "word_accuracy": word_acc,
+        "sample_level": sample_metrics,
+        "entity_level": entity_metrics
+    }
